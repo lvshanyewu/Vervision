@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vervision"
+version = "0.2.1"
+description = "Local project handoff and context router for AI agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "LSYW" }]
+dependencies = []
+
+[project.scripts]
+handoff = "vervision.cli:main"
+vervision = "vervision.cli:main"
+
+[tool.setuptools]
+packages = ["vervision"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+vervision = ["static/*"]

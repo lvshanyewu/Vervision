@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/*
+!dist/.gitkeep
+.venv/
+# Keep the checked-in PyInstaller recipe; generated specs remain ignored.
+*.spec
+!vervision.spec
+seed/
