@@ -13,6 +13,9 @@ if (-not (Test-Path -LiteralPath $sourceExe)) {
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 Copy-Item -LiteralPath $sourceExe -Destination (Join-Path $InstallDir "vervision.exe") -Force
 Copy-Item -LiteralPath (Join-Path $scriptRoot "templates") -Destination $InstallDir -Recurse -Force
+if (Test-Path -LiteralPath (Join-Path $scriptRoot "assets")) {
+  Copy-Item -LiteralPath (Join-Path $scriptRoot "assets") -Destination $InstallDir -Recurse -Force
+}
 $handoffExe = Join-Path $InstallDir "handoff.exe"
 if (Test-Path -LiteralPath $handoffExe) { Remove-Item -LiteralPath $handoffExe -Force }
 New-Item -ItemType HardLink -Path $handoffExe -Target (Join-Path $InstallDir "vervision.exe") | Out-Null

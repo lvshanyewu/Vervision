@@ -36,4 +36,4 @@ updated_at: "2026-09-10"
 - 核查命令：
 - 最近观察日期与适用范围：
 
-> `verified_at` 和 `verified_digest` 由 `handoff verify` 写入。外部 AI 不应伪造核验结果。
+> 核验基线由 `handoff verify` 保存在本机索引，不改写正文。外部 AI 不应伪造核验结果。临时进度写 continuation，测试数量、APK 哈希和版本历史写 CHANGELOG/发布记录。

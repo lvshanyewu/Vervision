@@ -142,7 +142,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(save_module(root, body, body.get("expected_revision")), 201)
             if parsed.path.endswith("/verify") and parsed.path.startswith("/api/modules/"):
                 module_id = urllib.parse.unquote(parsed.path.split("/")[-2])
-                return self._json(verify_module(root, module_id, body.get("expected_revision")))
+                result = verify_module(root, module_id, body.get("expected_revision"))
+                STATUS_CACHE.pop((str(root), module_id), None)
+                return self._json(result)
             if parsed.path == "/api/continuations":
                 return self._json(save_continuation(root, body), 201)
             if parsed.path == "/api/resolve":

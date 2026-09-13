@@ -20,10 +20,11 @@ class Document:
     path: Path
     meta: dict[str, Any]
     body: str
+    read_revision: str | None = None
 
     @property
     def revision(self) -> str:
-        return hashlib.sha256(self.path.read_bytes()).hexdigest()[:16]
+        return self.read_revision or hashlib.sha256(self.path.read_bytes()).hexdigest()[:16]
 
 
 def _value(raw: str) -> Any:
@@ -43,7 +44,8 @@ def _value(raw: str) -> Any:
 
 
 def parse_document(path: Path) -> Document:
-    text = path.read_text(encoding="utf-8-sig")
+    file_bytes = path.read_bytes()
+    text = file_bytes.decode("utf-8-sig").replace("\r\n", "\n")
     if not text.startswith("---"):
         raise ValueError("missing YAML frontmatter opener '---'")
     parts = text.split("---", 2)
@@ -69,7 +71,8 @@ def parse_document(path: Path) -> Document:
         else:
             meta[key] = _value(raw)
             pending_list = None
-    return Document(path=path, meta=meta, body=parts[2].lstrip("\r\n"))
+    return Document(path=path, meta=meta, body=parts[2].lstrip("\r\n"),
+                    read_revision=hashlib.sha256(file_bytes).hexdigest()[:16])
 
 
 def dump_document(meta: dict[str, Any], body: str) -> str:

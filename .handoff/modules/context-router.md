@@ -12,7 +12,7 @@ related_modules: []
 business_rules: ["resolve 先定位项目，再返回最多三份强相关模块和必要依赖摘要；默认 concise，detailed 提供完整诊断。", "FRESH 仅说明已记录来源摘要与当前来源摘要一致；文档语义核验由独立状态表达。", "更新已有模块必须携带 expected_revision；省略字段保留，显式空数组清空。", "search 命中的任意文档类型必须能由 handoff_get 读取。"]
 invariants: ["Markdown 是主数据，SQLite 只能作为可重建索引。", "module_verify 只能在 Agent 完成语义核对后调用。", "不得把密钥、个人数据或生产数据库写入交接与索引。", "项目证据不唯一时返回候选，不静默选择。"]
 consumers: ["Codex 等 MCP Agent", "handoff/vervision CLI", "本地 WebUI", "使用 .handoff 的其他个人项目"]
-updated_at: "2026-09-12T10:11:13+08:00"
+updated_at: "2026-09-12T19:55:45+08:00"
 verified_digest: "31ee38b5377e58f0d570e1451da3f5d911dc67a367529b85c4abdc8311761734"
 verified_at: "2026-09-12T10:11:13+08:00"
 verified_document_digest: "5c009bbeefd36ad45f55ce0970684a8e03d0765f6f005ee485b73ab002da3e70"
@@ -20,20 +20,20 @@ verified_document_digest: "5c009bbeefd36ad45f55ce0970684a8e03d0765f6f005ee485b73
 
 # 当前实现
 
-`core.py` 管理项目登记、候选发现与评分、文档读取、加权搜索、来源摘要、来源状态、文档语义核验状态、模块写入和 continuation。项目选择综合 MCP 工作区、显式 `workspace`、当前目录及父目录、相邻目录、登记表和任务相关度；只有唯一或分数明显领先时才自动选择。
+`core.py` 管理项目登记、文档检索、来源指纹、独立语义核验、模块写入和 continuation。显式项目优先；其次按工作区包含关系定位最近项目。多个工作区或无包含关系的多候选不按任务分数或唯一模块 ID 自动选择。检索标题、aliases、tags、sources、dependencies 权重高于正文，版本流水行过滤，正文得分封顶。
 
-`mcp_server.py` 暴露七个工具。Agent 从 `resolve` 开始；默认 concise 响应保留必要约束、状态和一份下一步参数，`detail=detailed` 返回完整诊断。一次 resolve 共享解析后的文档、受限来源清单和文件摘要，相同依赖只生成一份摘要。`search` 返回命中字段和短片段；`handoff_get` 统一读取 overview、module、continuation。支持 MCP Roots 的客户端初始化后通过 `roots/list` 提供工作区。
+`mcp_server.py` 的 resolve 返回仅当前 MCP 会话有效的 scope_id 和模块 revision。后续调用复用 scope；与显式项目或工作区冲突时拒绝。默认 structuredContent/concise，full=true 返回正文；module_get、overview_get、continuation_get 为正式接口，handoff_get 保留兼容。resolve.next_actions 使用 module_get_many。
 
-WebUI 和 CLI 复用同一 core。模块更新采用乐观并发控制：省略字段保留、显式空数组清空、未知扩展字段保留；无实质变化时不重写文件。所有写操作返回写后 revision。安装包由 `scripts/build-release.ps1` 生成。
+模块元数据使用部分更新；module_patch 支持唯一 ATX 标题内容和 fields。批量 module_save_many 每项独立保存并可 verify=true，采用明确的部分成功报告，不实现跨文件事务。module_save_and_verify 在同一项目写锁下完成保存和核验，核验失败保留保存并返回最终 revision 与错误。locking.py 提供跨进程写锁，单文件写入采用临时文件替换；revision 固定于文档读取快照。
 
-来源状态只回答关联源码相对最近基线是否变化。人工核验还会记录排除工具字段的文档语义指纹；正文或业务字段后来改变时显示 PENDING，旧文档没有该指纹时显示 UNKNOWN_LEGACY。WebUI 分开展示来源状态和交接语义核验，并明确前者不代表线上配置或运行环境有效。
+verify 将源码指纹、语义指纹、verified_at 写入本机 SQLite verification 表，不改写 Markdown。重复核验幂等，旧文件基线兼容，本机新基线优先。reindex 保留核验表；换机器或删除索引后需重新核验。source_freshness 只说明源码变化，document_verification 只记录 Agent/人工语义核对，external_checks 默认 NOT_CHECKED。工具不会核对正文中的测试数量、哈希或服务可用性。
 
-WebUI 项目列表会把所有模块的 `sources` 合并为一次受限文件清单，只扫描这些路径前缀，再为各模块计算状态；模块详情优先按约定文件名直接读取，并复用项目列表刚计算的状态。前端缓存已经访问过的项目列表，同时后台刷新，并用请求令牌阻止旧项目或旧卡片响应覆盖当前界面。
+临时进度写 continuation，更新需 expected_revision，省略字段保留，可只改 status=done。external_checks 保存 Agent 提供的 service/status/evidence/checked_at。版本历史写 CHANGELOG 或发布记录；长期规则改变时才 patch 模块，不自动搬运临时正文。
 
-根目录的 `启动 Vervision.cmd` 和 `start-vervision.cmd` 调用 `scripts/start-vervision.ps1`。启动脚本先检查 8765 上是否已有 Vervision，再依次查找已安装程序、解压包 EXE、最新版本化 EXE、旧版 EXE和源码 Python 入口；服务就绪后才打开浏览器，失败信息写入 `%LOCALAPPDATA%\Vervision\logs`。
+WebUI、CLI 复用 core；WebUI 展示源码新鲜度、独立文档核验和外部状态边界，核验后清除对应状态缓存。根目录启动脚本调用 scripts/start-vervision.ps1。安装包由 scripts/build-release.ps1 根据包版本生成。
 
 ## 验证与回退
 
-- 单元测试覆盖部分更新与冲突、无变化保存、双维核验状态、共享来源扫描、紧凑/详细响应、统一读取、跨项目任务选择和 MCP file roots 解析。
-- 修改路由协议后运行 `python -m unittest discover -s tests -v`，再执行一次真实 MCP JSON-RPC 冒烟测试。
-- 回退以 Git 提交为单位；项目 `.handoff` 文件和本地登记表无需随程序回退。
+- 运行 python -m unittest discover -s tests -v、真实 MCP JSON-RPC 冒烟及项目 validate。
+- scripts/benchmark-mcp.py 对指定 Git 旧版本测量隔离双模块维护调用数与响应字符数，不作为 token 计费估算。
+- 回退以 Git 提交为单位；Markdown 仍是长期知识事实源，本机核验记录可以丢弃后重新核对。

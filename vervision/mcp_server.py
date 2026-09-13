@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import secrets
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -11,15 +12,19 @@ from . import __version__
 from .core import (
     continuation_documents, get_document, get_module, module_status, resolve_task,
     save_continuation, save_module, search, select_project, verify_module,
+    patch_module, save_and_verify, RevisionConflict,
 )
 
 
 WORKSPACE_ROOTS: list[Path] = []
 ROOTS_REQUEST_ID = "vervision-roots-1"
+SCOPES: dict[str, Path] = {}
 
 
 def _workspace_properties() -> dict[str, Any]:
     return {
+        "scope_id": {"type": "string", "description": "Session project scope returned by resolve; invalid after server restart."},
+        "full": {"type": "boolean", "default": False, "description": "Include body and diagnostic detail."},
         "project": {"type": "string", "description": "Optional registered project id or path."},
         "workspace": {"type": "string", "description": "Current workspace path when the MCP client does not expose roots."},
     }
@@ -42,15 +47,47 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "title": {"type": "string"}, "module_id": {"type": "string"}, "status": {"type": "string", "enum": ["open", "blocked", "done"]}, "next_step": {"type": "string"}, "body": {"type": "string"}, **_workspace_properties()}, "required": ["id", "title", "module_id", "status", "next_step"]}},
 ]
 
+# Derive schemas from the same source to keep aliases and batch contracts aligned.
+for kind in ("module", "overview", "continuation"):
+    TOOLS.append({"name": f"{kind}_get", "description": f"Read a {kind}; full=true includes body.",
+                  "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, **_workspace_properties()}, "required": ["id"]}})
+_fields = dict(next(t for t in TOOLS if t["name"] == "module_save")["inputSchema"]["properties"])
+for key in _workspace_properties():
+    _fields.pop(key, None)
+_patch = {"fields": {"type": "object", "properties": {k: v for k, v in _fields.items() if k not in ("id", "body", "expected_revision")}, "additionalProperties": False},
+          "sections": {"type": "array", "items": {"type": "object", "properties": {"heading": {"type": "string"}, "body": {"type": "string"}}, "required": ["heading", "body"], "additionalProperties": False}}}
+_change = {"type": "object", "properties": {**_fields, **_patch, "verify": {"type": "boolean", "default": False}}, "required": ["id"], "additionalProperties": False}
+TOOLS.extend([
+    {"name": "module_get_many", "description": "Read selected modules in one call; full=true includes bodies.", "inputSchema": {"type": "object", "properties": {"ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 50}, **_workspace_properties()}, "required": ["ids"]}},
+    {"name": "module_patch", "description": "Patch metadata fields or uniquely named Markdown heading contents. Requires expected_revision; surrounding sections are preserved.", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "expected_revision": {"type": "string"}, **_patch, **_workspace_properties()}, "required": ["id", "expected_revision"]}},
+    {"name": "module_save_many", "description": "Save/patch up to 50 modules; explicit partial success, no batch rollback. verify=true attests Agent semantic review per item. Returns final revisions.", "inputSchema": {"type": "object", "properties": {"changes": {"type": "array", "items": _change, "minItems": 1, "maxItems": 50}, **_workspace_properties()}, "required": ["changes"]}},
+    {"name": "module_save_and_verify", "description": "Save/patch and attest completed semantic review in one call. Save remains if verification fails; final revision always returned.", "inputSchema": {"type": "object", "properties": {**_change["properties"], **_workspace_properties()}, "required": ["id"]}},
+])
+_continuation = next(t for t in TOOLS if t["name"] == "continuation_save")["inputSchema"]
+_continuation["required"] = ["id"]
+_continuation["properties"].update({"expected_revision": {"type": "string"}, "external_checks": {"type": "array", "items": {"type": "object", "properties": {"service": {"type": "string"}, "status": {"type": "string"}, "evidence": {"type": "string"}, "checked_at": {"type": "string"}}, "required": ["service", "status", "evidence", "checked_at"], "additionalProperties": False}}})
+
 
 def _workspaces(args: dict[str, Any]) -> list[Path]:
-    values = list(WORKSPACE_ROOTS)
     if args.get("workspace"):
-        values.insert(0, Path(str(args["workspace"])))
-    return values
+        return [Path(str(args["workspace"]))]
+    return list(WORKSPACE_ROOTS)
 
 
 def _selection(args: dict[str, Any], *, task: str = "", document_id: str | None = None) -> dict[str, Any]:
+    if args.get("scope_id"):
+        root = SCOPES.get(str(args["scope_id"]))
+        if root is None or not (root / ".handoff" / "overview.md").is_file():
+            raise ValueError("Unknown or expired scope_id; call resolve again with explicit project/workspace.")
+        if args.get("project"):
+            selected = select_project(project=args["project"])
+            if Path(selected["selected"]).resolve() != root:
+                raise ValueError("scope_id conflicts with project")
+        if args.get("workspace"):
+            workspace = Path(args["workspace"]).resolve()
+            if workspace != root and root not in workspace.parents:
+                raise ValueError("scope_id conflicts with workspace")
+        return {"selected": str(root), "status": "selected", "reason": "session scope", "candidates": []}
     return select_project(task=task, project=args.get("project"), workspaces=_workspaces(args) or None,
                           document_id=document_id)
 
@@ -63,31 +100,54 @@ def _root_or_error(args: dict[str, Any], *, task: str = "", document_id: str | N
     return Path(selection["selected"]), selection
 
 
-def call_tool(name: str, args: dict[str, Any]) -> Any:
+def _call_tool(name: str, args: dict[str, Any]) -> Any:
     if name == "resolve":
         selection = _selection(args, task=str(args["task"]))
         if not selection.get("selected"):
             return {"task": args["task"], "project_selection": selection,
-                    "next_actions": [{"tool": "resolve", "arguments": {"task": args["task"], "project": c["id"]}}
+                    "next_actions": [{"tool": "resolve", "arguments": {"task": args["task"], "project": c["path"]}}
                                      for c in selection["candidates"]]}
-        detail = str(args.get("detail", "concise"))
+        detail = "detailed" if args.get("full") else str(args.get("detail", "concise"))
         result = resolve_task(Path(selection["selected"]), str(args["task"]), detail=detail)
-        if detail == "detailed" or not args.get("project"):
+        root = Path(selection["selected"]).resolve()
+        scope = next((key for key, value in SCOPES.items() if value == root), None)
+        if scope is None:
+            scope = secrets.token_urlsafe(18)
+            SCOPES[scope] = root
+        result["scope_id"] = scope
+        for action in result["next_actions"]:
+            action["arguments"].pop("project", None)
+            action["arguments"]["scope_id"] = scope
+        if detail == "detailed" or args.get("full"):
             result["project_selection"] = selection
         return result
     if name == "search":
         root, selection = _root_or_error(args, task=str(args["query"]))
         return {"project_selection": selection, "results": search(root, str(args["query"]))}
-    if name in ("handoff_get", "module_get"):
+    if name == "module_get_many":
+        root, _ = _root_or_error(args)
+        ids = args["ids"]
+        if not isinstance(ids, list) or not 1 <= len(ids) <= 50:
+            raise ValueError("ids must contain 1..50 module ids")
+        results = []
+        for document_id in ids:
+            try:
+                value = call_tool("module_get", {"project": str(root), "id": document_id, "full": args.get("full", False)})
+                value.pop("project_selection", None)
+                results.append(value)
+            except Exception as exc:
+                results.append({"id": document_id, "error": str(exc)})
+        return {"results": results}
+    if name in ("handoff_get", "module_get", "overview_get", "continuation_get"):
         document_id = str(args.get("id") or args.get("module_id"))
         root, selection = _root_or_error(args, document_id=document_id)
-        doc = get_document(root, document_id, args.get("type") or ("module" if name == "module_get" else None))
+        doc = get_document(root, document_id, args.get("type") or (name.removesuffix("_get") if name != "handoff_get" else None))
         value = {**doc.meta, "revision": doc.revision, "path": str(doc.path), "project_selection": selection}
         if doc.meta.get("type") == "module":
             value["freshness"] = module_status(root, doc)
             value["continuations"] = [{**d.meta, "body": d.body} for d in continuation_documents(root)
                                       if d.meta.get("module_id") == doc.meta.get("id")]
-        if args.get("full", True):
+        if args.get("full", False):
             value["body"] = doc.body
         return value
     document_id = str(args.get("module_id") or args.get("id") or "")
@@ -95,12 +155,96 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
     if name == "module_status":
         return module_status(root, get_module(root, str(args["module_id"])))
     if name == "module_save":
-        return save_module(root, args, args.get("expected_revision"))
+        return save_and_verify(root, args)
+    if name == "module_patch":
+        return save_and_verify(root, args)
+    if name == "module_save_and_verify":
+        return save_and_verify(root, {**args, "verify": True})
+    if name == "module_save_many":
+        changes = args["changes"]
+        if not isinstance(changes, list) or not 1 <= len(changes) <= 50:
+            raise ValueError("changes must contain 1..50 items")
+        ids = [item["id"] for item in changes]
+        if len(set(ids)) != len(ids):
+            raise ValueError("Duplicate module ids in batch")
+        if any(set(item) & set(_workspace_properties()) for item in changes):
+            raise ValueError("Project scope belongs on the batch, not individual changes")
+        results = []
+        for change in changes:
+            try:
+                results.append({"ok": True, **save_and_verify(root, change)})
+            except Exception as exc:
+                results.append({"id": change.get("id"), "ok": False, "changed": False,
+                                "error": getattr(exc, "details", {"message": str(exc)})})
+        return {"mode": "partial", "results": results,
+                "ok": all(r["ok"] and not r.get("verification_error") for r in results)}
     if name == "module_verify":
         return verify_module(root, str(args["module_id"]), args.get("expected_revision"))
     if name == "continuation_save":
         return save_continuation(root, args)
     raise KeyError(f"Unknown tool '{name}'")
+
+
+def call_tool(name: str, args: dict[str, Any]) -> Any:
+    if name not in {t["name"] for t in TOOLS}:
+        raise KeyError(f"Unknown tool '{name}'")
+    schema = next(t["inputSchema"] for t in TOOLS if t["name"] == name)
+    _validate(args, schema)
+    result = _call_tool(name, args)
+    if args.get("full") or args.get("detail") == "detailed":
+        return result
+    if name == "resolve":
+        for item in result.get("matches", []):
+            item.pop("match_reason", None)
+            item.pop("source_patterns", None)
+            item.pop("consumers", None)
+            item["freshness"] = {"source_freshness": item["freshness"]["state"],
+                                 "document_verification": item["freshness"]["document_verification"]["state"],
+                                 "external_checks": "NOT_CHECKED"}
+        return result
+    if name.endswith("_get"):
+        if "freshness" in result:
+            result["source_freshness"] = result["freshness"]["state"]
+            result["document_verification"] = result["freshness"]["document_verification"]["state"]
+            result["external_checks"] = "NOT_CHECKED"
+        return {k: v for k, v in result.items() if k in ("id", "type", "title", "summary", "revision", "status", "next_step", "module_id", "external_checks", "source_freshness", "document_verification")}
+    if name == "module_save_many":
+        result["results"] = [_compact_write(item) for item in result["results"]]
+    if name in ("module_save", "module_patch", "module_verify", "module_save_and_verify", "continuation_save"):
+        return _compact_write(result)
+    result.pop("project_selection", None)
+    result.pop("path", None)
+    return result
+
+
+def _compact_write(value):
+    return {k: v for k, v in value.items() if k in (
+        "id", "module_id", "revision", "changed", "verified", "verification_changed", "status", "state",
+        "ok", "error", "verification_error", "warnings")}
+
+
+def _validate(value, schema, path="arguments"):
+    expected = schema.get("type")
+    types = {"object": dict, "array": list, "string": str, "boolean": bool}
+    if expected in types and not isinstance(value, types[expected]):
+        raise ValueError(f"{path} must be {expected}")
+    if "enum" in schema and value not in schema["enum"]:
+        raise ValueError(f"{path} must be one of {schema['enum']}")
+    if isinstance(value, dict):
+        properties = schema.get("properties", {})
+        missing = set(schema.get("required", [])) - value.keys()
+        if missing:
+            raise ValueError(f"{path} missing: {', '.join(sorted(missing))}")
+        unknown = value.keys() - properties.keys()
+        if unknown and schema.get("additionalProperties") is False:
+            raise ValueError(f"{path} unknown fields: {', '.join(sorted(unknown))}")
+        for key in value.keys() & properties.keys():
+            _validate(value[key], properties[key], f"{path}.{key}")
+    elif isinstance(value, list):
+        if not schema.get("minItems", 0) <= len(value) <= schema.get("maxItems", float("inf")):
+            raise ValueError(f"{path} has invalid item count")
+        for item in value:
+            _validate(item, schema.get("items", {}), f"{path}[]")
 
 
 def _write(payload: dict[str, Any]) -> None:
@@ -142,6 +286,7 @@ def run() -> None:
             if request_id == ROOTS_REQUEST_ID and "result" in req:
                 _accept_roots(dict(req["result"] or {}))
             elif method == "initialize":
+                SCOPES.clear()
                 client_supports_roots = bool(req.get("params", {}).get("capabilities", {}).get("roots"))
                 _response(request_id, {"protocolVersion": "2025-06-18", "capabilities": {"tools": {"listChanged": False}},
                                        "serverInfo": {"name": "vervision", "version": __version__}})
@@ -157,9 +302,9 @@ def run() -> None:
                 params = req.get("params", {})
                 try:
                     result = call_tool(str(params.get("name")), dict(params.get("arguments") or {}))
-                    _response(request_id, {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}], "isError": False})
+                    _response(request_id, {"structuredContent": result, "content": [{"type": "text", "text": "Vervision result is in structuredContent."}], "isError": False})
                 except Exception as exc:
-                    _response(request_id, {"content": [{"type": "text", "text": str(exc)}], "isError": True})
+                    _response(request_id, {"structuredContent": {"error": getattr(exc, "details", {"message": str(exc)})}, "content": [{"type": "text", "text": str(exc)}], "isError": True})
             elif method == "ping":
                 _response(request_id, {})
             elif request_id is not None and not str(method).startswith("notifications/"):

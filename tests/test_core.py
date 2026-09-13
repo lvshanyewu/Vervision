@@ -14,7 +14,7 @@ class CoreTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        self.old_registry, self.old_index = core.REGISTRY, core.INDEX
+        self.old_registry, self.old_index, self.old_home = core.REGISTRY, core.INDEX, core.APP_HOME
         core.APP_HOME = self.root / ".app-data"
         core.REGISTRY = core.APP_HOME / "projects.json"
         core.INDEX = core.APP_HOME / "index.sqlite3"
@@ -29,6 +29,7 @@ class CoreTests(unittest.TestCase):
 
     def tearDown(self):
         core.REGISTRY, core.INDEX = self.old_registry, self.old_index
+        core.APP_HOME = self.old_home
         self.temp.cleanup()
 
     def test_freshness_loop(self):
@@ -70,7 +71,7 @@ class CoreTests(unittest.TestCase):
         after = get_module(self.root, "feature")
         self.assertFalse(result["changed"])
         self.assertEqual(result["revision"], before.revision)
-        self.assertEqual(after.meta["verified_digest"], before.meta["verified_digest"])
+        self.assertEqual(core.verification_baseline(self.root, after), core.verification_baseline(self.root, before))
 
     def test_markdown_trailing_spaces_are_preserved(self):
         before = get_module(self.root, "feature")
@@ -96,10 +97,9 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(module_status(self.root, get_module(self.root, "feature"))["document_verification"]["state"], "VERIFIED")
 
     def test_legacy_verified_document_is_reported_honestly(self):
-        verify_module(self.root, "feature")
         path = self.root / ".handoff" / "modules" / "feature.md"
         doc = get_module(self.root, "feature")
-        doc.meta.pop("verified_document_digest")
+        doc.meta["verified_digest"] = core.source_digest(self.root, doc.meta["sources"])[0]
         path.write_text(core.dump_document(doc.meta, doc.body), encoding="utf-8")
         status = module_status(self.root, get_module(self.root, "feature"))
         self.assertEqual(status["state"], "FRESH")
@@ -132,13 +132,13 @@ class CoreTests(unittest.TestCase):
 
     def test_search_result_can_be_read_through_unified_reader(self):
         result = next(item for item in search(self.root, "overview") if item["type"] == "overview")
-        self.assertEqual(result["next_action"]["tool"], "handoff_get")
+        self.assertEqual(result["next_action"]["tool"], "overview_get")
         doc = get_document(self.root, result["id"], "overview")
         self.assertEqual(doc.meta["type"], "overview")
         value = call_tool("handoff_get", {"project": str(self.root), "id": result["id"]})
         self.assertEqual(value["type"], "overview")
 
-    def test_task_relevance_can_select_registered_adjacent_project(self):
+    def test_task_relevance_cannot_override_workspace(self):
         other = self.root.parent / f"{self.root.name}-vervision"
         try:
             init_project(other, "vervision-test", "Vervision Test")
@@ -146,7 +146,7 @@ class CoreTests(unittest.TestCase):
             save_module(other, {"id": "router", "title": "Vervision MCP router",
                         "summary": "Resolve the correct project", "sources": ["router.py"], "body": "# Router"}, "new")
             selected = select_project(task="repair Vervision MCP router", workspaces=[self.root])
-            self.assertEqual(Path(selected["selected"]), other)
+            self.assertEqual(Path(selected["selected"]), self.root)
         finally:
             import shutil
             shutil.rmtree(other, ignore_errors=True)
@@ -169,7 +169,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["matches"][0]["business_rules"], ["Count accepted essays only"])
         self.assertEqual(result["matches"][0]["dependencies"], ["foundation"])
         self.assertEqual(result["dependency_summaries"][0]["id"], "foundation")
-        self.assertEqual(result["next_actions"][0]["tool"], "handoff_get")
+        self.assertEqual(result["next_actions"][0]["tool"], "module_get_many")
 
     def test_resolve_uses_one_inventory_and_reuses_file_digests(self):
         save_module(self.root, {"id": "foundation", "title": "Foundation", "summary": "Shared",
@@ -218,6 +218,7 @@ class CoreTests(unittest.TestCase):
         init_project(second, "project-b", "Project B")
         workspace.mkdir()
         core._save_registry({"project-a": str(first), "project-b": str(second)})
+        (self.root / ".handoff" / "overview.md").unlink()
         selection = select_project(workspaces=[workspace])
         self.assertEqual(selection["status"], "ambiguous")
         self.assertTrue({"project-a", "project-b"}.issubset({item["id"] for item in selection["candidates"]}))

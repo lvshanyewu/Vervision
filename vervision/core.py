@@ -7,12 +7,15 @@ import os
 import re
 import shutil
 import sqlite3
+import tempfile
 from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from contextlib import contextmanager
 
 from .formats import Document, dump_document, parse_document, validate_document
+from .locking import writer
 
 
 APP_HOME = Path(os.environ.get("LOCALAPPDATA", Path.home() / ".local")) / "Vervision"
@@ -25,6 +28,18 @@ SEMANTIC_DIGEST_EXCLUDED_FIELDS = {
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def _write_document(path: Path, meta: dict[str, Any], body: str) -> None:
+    """Readers see either the previous complete document or the new one."""
+    descriptor, temporary = tempfile.mkstemp(prefix=".vervision-", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(dump_document(meta, body))
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def _load_registry() -> dict[str, str]:
@@ -138,15 +153,16 @@ def select_project(
     if not candidates:
         return {"status": "not_found", "selected": None, "reason": "No initialized project was found.", "candidates": []}
     top = candidates[0]
-    runner_score = candidates[1]["score"] if len(candidates) > 1 else -1
-    unique_document = document_id and sum(
-        any(str(d.meta.get("id")) == document_id for d in project_documents(Path(c["path"]))) for c in candidates
-    ) == 1
-    clear_task_match = top["task_relevance"] > 0 and top["score"] - runner_score >= 8
-    exact_workspace = any(Path(top["path"]) == start for start in starts) and top["task_relevance"] >= max(
-        (c["task_relevance"] for c in candidates[1:]), default=0
-    )
-    if len(candidates) == 1 or unique_document or clear_task_match or exact_workspace:
+    anchored = {}
+    for start in starts:
+        containing = [c for c in candidates if Path(c["path"]) == start or Path(c["path"]) in start.parents]
+        if containing:
+            nearest = max(containing, key=lambda c: len(Path(c["path"]).parts))
+            anchored[nearest["path"]] = nearest
+    if len(anchored) == 1:
+        selected = next(iter(anchored))
+        return {"status": "selected", "selected": selected, "reason": "workspace containment", "candidates": candidates[:5]}
+    if len(candidates) == 1:
         return {"status": "selected", "selected": top["path"], "reason": "unique clear match", "candidates": candidates[:5]}
     return {"status": "ambiguous", "selected": None,
             "reason": "Several projects are plausible; choose one by id or path.", "candidates": candidates[:5]}
@@ -292,7 +308,8 @@ def module_status(
     digest_cache: dict[Path, bytes] | None = None,
 ) -> dict[str, Any]:
     current, files, missing = source_digest(root, doc.meta.get("sources", []), inventory, digest_cache)
-    verified = str(doc.meta.get("verified_digest", ""))
+    baseline = verification_baseline(root, doc)
+    verified = str(baseline.get("verified_digest", ""))
     if not verified:
         state = "UNVERIFIED"
         reason = "No verification baseline has been recorded."
@@ -305,7 +322,7 @@ def module_status(
     else:
         state = "FRESH"
         reason = "Associated source content matches the verification baseline."
-    verified_document = str(doc.meta.get("verified_document_digest", ""))
+    verified_document = str(baseline.get("verified_document_digest", ""))
     if verified_document:
         document_state = ("VERIFIED" if document_semantic_digest(doc.meta, doc.body) == verified_document
                           else "PENDING")
@@ -319,30 +336,57 @@ def module_status(
         document_state = "UNVERIFIED"
         document_reason = "No semantic verification baseline has been recorded."
     return {
-        "state": state, "reason": reason, "verified_at": doc.meta.get("verified_at"),
+        "state": state, "reason": reason, "verified_at": baseline.get("verified_at"),
+        "source_freshness": {"state": state, "digest": current},
+        "external_checks": {"state": "NOT_CHECKED"},
         "updated_at": doc.meta.get("updated_at"), "source_count": len(files),
         "sources": files, "missing_sources": missing, "revision": doc.revision,
         "document_verification": {"state": document_state, "reason": document_reason},
     }
 
 
+@contextmanager
+def _verification_db():
+    APP_HOME.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(INDEX)
+    try:
+        with db:
+            db.execute("CREATE TABLE IF NOT EXISTS verification (root TEXT, id TEXT, value TEXT, PRIMARY KEY(root,id))")
+            yield db
+    finally:
+        db.close()
+
+
+def verification_baseline(root: Path, doc: Document) -> dict[str, Any]:
+    if INDEX.exists():
+        with _verification_db() as db:
+            row = db.execute("SELECT value FROM verification WHERE root=? AND id=?",
+                             (str(root.resolve()), doc.meta["id"])).fetchone()
+        if row:
+            return json.loads(row[0])
+    return doc.meta  # Existing portable baselines remain readable.
+
+
+@writer
 def verify_module(root: Path, module_id: str, expected_revision: str | None = None) -> dict[str, Any]:
     doc = get_module(root, module_id)
     if expected_revision and doc.revision != expected_revision:
-        raise RuntimeError("Document changed since it was read; reload before verifying.")
+        raise RevisionConflict(doc, {}, expected_revision)
     digest, files, missing = source_digest(root, doc.meta.get("sources", []))
     if missing:
         raise ValueError("Cannot verify; missing source paths: " + ", ".join(missing))
-    verified_at = now_iso()
-    doc.meta["verified_digest"] = digest
-    doc.meta["verified_document_digest"] = document_semantic_digest(doc.meta, doc.body)
-    doc.meta["verified_at"] = verified_at
-    doc.meta["updated_at"] = verified_at
-    doc.path.write_text(dump_document(doc.meta, doc.body), encoding="utf-8")
-    rebuild_index(root)
-    revision = parse_document(doc.path).revision
+    semantic = document_semantic_digest(doc.meta, doc.body)
+    old = verification_baseline(root, doc)
+    changed = old.get("verified_digest") != digest or old.get("verified_document_digest") != semantic
+    verified_at = now_iso() if changed else old.get("verified_at")
+    if changed:
+        with _verification_db() as db:
+            db.execute("INSERT OR REPLACE INTO verification VALUES (?,?,?)", (str(root.resolve()), module_id,
+                       json.dumps({"verified_digest": digest, "verified_document_digest": semantic, "verified_at": verified_at})))
+    revision = doc.revision
     return {"module_id": module_id, "state": "FRESH", "source_count": len(files),
-            "verified_at": verified_at, "revision": revision}
+            "verified_at": verified_at, "revision": revision, "changed": False,
+            "verification_changed": changed, "verified": True, "external_checks": {"state": "NOT_CHECKED"}}
 
 
 def get_module(root: Path, module_id: str) -> Document:
@@ -439,15 +483,20 @@ def search(
     for run in cjk_runs:
         if len(run) >= 2:
             terms.extend(run[i:i + 2] for i in range(len(run) - 1))
-    terms = list(dict.fromkeys(terms))
+    terms = [t for t in dict.fromkeys(terms) if not re.fullmatch(r"[\dv.\-]+", t)]
     ranked = []
     for doc in documents if documents is not None else project_documents(root):
         title = str(doc.meta.get("title", ""))
         summary = str(doc.meta.get("summary", ""))
         aliases = " ".join(map(str, doc.meta.get("aliases", [])))
         tags = " ".join(map(str, doc.meta.get("tags", [])))
-        fields = [(title.lower(), 8), (aliases.lower(), 7), (tags.lower(), 5), (summary.lower(), 4), (doc.body.lower(), 1)]
+        fields = [(title.lower(), 12), (aliases.lower(), 12), (tags.lower(), 10), (summary.lower(), 6),
+                  (" ".join(map(str, doc.meta.get("sources", []))).lower(), 9),
+                  (" ".join(map(str, doc.meta.get("dependencies", []))).lower(), 8)]
+        body = "\n".join(line for line in doc.body.lower().splitlines()
+                         if not re.search(r"\b\d+\.\d+\.\d+\b|\b20\d\d[-/]\d|sha256|apk.*hash", line))
         score = sum(weight for term in terms for text, weight in fields if term in text)
+        score += min(2, sum(1 for term in terms if term in body))
         if not terms or score:
             ranked.append((score, doc))
     ranked.sort(key=lambda item: (-item[0], str(item[1].meta.get("title", ""))))
@@ -460,15 +509,17 @@ def search(
         for name, text in (("title", str(doc.meta.get("title", ""))),
                            ("aliases", " ".join(map(str, doc.meta.get("aliases", [])))),
                            ("tags", " ".join(map(str, doc.meta.get("tags", [])))),
-                           ("summary", str(doc.meta.get("summary", ""))), ("body", doc.body)):
+                           ("summary", str(doc.meta.get("summary", ""))),
+                           ("sources", " ".join(map(str, doc.meta.get("sources", [])))),
+                           ("dependencies", " ".join(map(str, doc.meta.get("dependencies", [])))), ("body", doc.body)):
             if any(term in text.lower() for term in terms):
                 matched_fields.append(name)
         result["match_reason"] = {"fields": matched_fields,
                                   "snippet": next((line.strip()[:160] for line in doc.body.splitlines()
                                                    if any(term in line.lower() for term in terms)), None)}
         if include_next:
-            result["next_action"] = {"tool": "handoff_get", "arguments": {
-                "project": project_id, "id": doc.meta.get("id"), "type": doc.meta.get("type"), "full": True,
+            result["next_action"] = {"tool": f"{doc.meta.get('type')}_get", "arguments": {
+                "project": str(root.resolve()), "id": doc.meta.get("id"), "full": True,
             }}
         results.append(result)
     return results
@@ -507,6 +558,7 @@ def resolve_task(root: Path, task: str, limit: int = 3, detail: str = "concise")
             continue
         dep_doc, dep_status = modules[dep], statuses[dep]
         summary = {"id": dep, "title": dep_doc.meta.get("title"), "summary": dep_doc.meta.get("summary"),
+                   "recommendation": "related",
                    "freshness": dep_status["state"],
                    "document_verification": dep_status["document_verification"]}
         if detail == "detailed":
@@ -526,15 +578,18 @@ def resolve_task(root: Path, task: str, limit: int = 3, detail: str = "concise")
             result["freshness"] = {key: full_status[key] for key in
                                    ("state", "reason", "document_verification", "missing_sources")}
             result["source_patterns"] = doc.meta.get("sources", [])
-            result.pop("revision", None)
             result.pop("score", None)
         result["business_rules"] = doc.meta.get("business_rules", [])
         result["invariants"] = doc.meta.get("invariants", [])
         result["consumers"] = doc.meta.get("consumers", [])
         result["dependencies"] = [str(dep) for dep in doc.meta.get("dependencies", [])]
         result["related_modules"] = doc.meta.get("related_modules", [])
+        strong = set(result["match_reason"]["fields"]) & {"title", "aliases", "tags", "sources"}
+        modifying = bool(re.search(r"更新|修改|修复|优化|上传|发布|update|fix|change|upload|release", task, re.I))
+        result["recommendation"] = "modify" if strong and modifying else "read"
         result["open_continuations"] = [
-            {"id": c.meta.get("id"), "title": c.meta.get("title"), "next_step": c.meta.get("next_step")}
+            {"id": c.meta.get("id"), "title": c.meta.get("title"), "next_step": c.meta.get("next_step"),
+             "revision": c.revision, "status": c.meta.get("status"), "external_checks": c.meta.get("external_checks", [])}
             for c in continuations if c.meta.get("module_id") == result["id"] and c.meta.get("status") != "done"
         ]
         result.pop("next_action", None)
@@ -542,25 +597,33 @@ def resolve_task(root: Path, task: str, limit: int = 3, detail: str = "concise")
             "project_context": {"summary": overview.meta.get("summary"),
                                  "architecture": overview.meta.get("architecture_summary", overview.meta.get("summary", ""))},
             "matches": results, "dependency_summaries": dependency_summaries,
-            "next_actions": ([{"tool": "handoff_get", "arguments": {"project": overview.meta.get("id"),
-                                "id": results[0]["id"], "type": "module", "full": True}}]
-                             if results else [{"tool": "search", "arguments": {"project": overview.meta.get("id"), "query": task}}])}
+            "next_actions": ([{"tool": "module_get_many", "arguments": {"project": str(root.resolve()),
+                                "ids": [r["id"] for r in results], "full": True}}]
+                             if results else [{"tool": "search", "arguments": {"project": str(root.resolve()), "query": task}}])}
 
 
+@writer
 def save_module(root: Path, payload: dict[str, Any], expected_revision: str | None = None) -> dict[str, Any]:
     module_id = str(payload.get("id", "")).strip()
-    if not module_id:
-        raise ValueError("id is required")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", module_id):
+        raise ValueError("Invalid module id")
     path = root / ".handoff" / "modules" / f"{module_id}.md"
-    current: Document | None = None
-    if path.exists():
+    try:
+        current = get_module(root, module_id)
+        path = current.path
+    except KeyError:
+        current = None
+    if current is not None:
         if expected_revision == "new":
             raise FileExistsError(f"Module '{module_id}' already exists")
         if not expected_revision:
             raise RuntimeError("expected_revision is required when updating an existing module.")
-        current = parse_document(path)
         if current.revision != expected_revision:
-            raise RuntimeError("Document changed since it was read; reload before saving.")
+            raise RevisionConflict(current, payload, expected_revision)
+    elif path.exists():
+        raise FileExistsError(f"Target path contains another document: {path}")
+    elif expected_revision not in (None, "new"):
+        raise RuntimeError(f"Module '{module_id}' no longer exists; use expected_revision='new' only to intentionally recreate it.")
 
     list_fields = ("aliases", "tags", "sources", "dependencies", "related_modules",
                    "business_rules", "invariants", "consumers")
@@ -587,12 +650,16 @@ def save_module(root: Path, payload: dict[str, Any], expected_revision: str | No
     if errors:
         raise ValueError("; ".join(errors))
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(dump_document(meta, body), encoding="utf-8")
+    _write_document(path, meta, body)
     rebuild_index(root)
-    return {"id": module_id, "path": str(path), "revision": parse_document(path).revision,
-            "changed": True}
+    result = {"id": module_id, "path": str(path), "revision": parse_document(path).revision,
+              "changed": True}
+    if re.search(r"本次|尚未完成|等待|重试|临时失败|下一步|\b(?:retry|pending|next step)\b", body, re.I):
+        result["warnings"] = ["Temporary progress belongs in continuation_save; release facts belong in CHANGELOG/release records."]
+    return result
 
 
+@writer
 def archive_module(root: Path, module_id: str, expected_revision: str | None = None) -> dict[str, Any]:
     doc = get_module(root, module_id)
     if expected_revision and doc.revision != expected_revision:
@@ -605,11 +672,17 @@ def archive_module(root: Path, module_id: str, expected_revision: str | None = N
     return {"id": module_id, "archived_to": str(target), "revision": parse_document(target).revision}
 
 
+@writer
 def save_continuation(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
     task_id = str(payload.get("id", "")).strip()
-    if not task_id:
-        raise ValueError("id is required")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", task_id):
+        raise ValueError("Invalid continuation id")
     path = root / ".handoff" / "continuations" / f"{task_id}.md"
+    current = parse_document(path) if path.exists() else None
+    if current:
+        if payload.get("expected_revision") != current.revision:
+            raise RevisionConflict(current, payload, payload.get("expected_revision"))
+        payload = {**current.meta, "body": current.body, **payload}
     meta = {
         "schema_version": 1, "type": "continuation", "id": task_id,
         "title": payload.get("title", task_id), "module_id": payload.get("module_id", ""),
@@ -617,16 +690,100 @@ def save_continuation(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
         "updated_at": now_iso(),
     }
     body = str(payload.get("body", ""))
+    if meta["status"] not in ("open", "blocked", "done"):
+        raise ValueError("Invalid continuation status")
+    get_module(root, str(meta["module_id"]))
+    if "external_checks" in payload:
+        meta["external_checks"] = payload["external_checks"]
+    if current and document_semantic_digest(meta, body.rstrip("\r\n")) == document_semantic_digest(current.meta, current.body.rstrip("\r\n")):
+        return {"id": task_id, "revision": current.revision, "changed": False, "status": meta["status"]}
     preview = Document(path, meta, body)
     errors = validate_document(preview)
     if errors:
         raise ValueError("; ".join(errors))
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(dump_document(meta, body), encoding="utf-8")
+    _write_document(path, meta, body)
     rebuild_index(root)
-    return {"id": task_id, "path": str(path), "revision": parse_document(path).revision}
+    return {"id": task_id, "path": str(path), "revision": parse_document(path).revision, "changed": True, "status": meta["status"]}
 
 
+class RevisionConflict(RuntimeError):
+    def __init__(self, current, payload, expected):
+        from difflib import unified_diff
+        self.details = {"code": "revision_conflict", "id": current.meta["id"],
+                        "expected_revision": expected, "revision": current.revision,
+                        "message": "Reload affected fields and reapply; diff compares current with requested content, not the unavailable old base.",
+                        "fields": {k: {"current": current.meta.get(k), "requested": v}
+                                   for k, v in payload.items() if k in current.meta and current.meta[k] != v}}
+        if "body" in payload:
+            self.details["diff"] = "".join(unified_diff(current.body.splitlines(True), str(payload["body"]).splitlines(True),
+                                                      fromfile="current", tofile="requested"))[:4000]
+        super().__init__("Document changed since it was read; reload before saving.")
+
+
+@writer
+def patch_module(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Replace unique Markdown sections; preserve all surrounding bytes in the body."""
+    doc = get_module(root, str(payload["id"]))
+    if payload.get("expected_revision") != doc.revision:
+        conflict = RevisionConflict(doc, payload.get("fields", {}), payload.get("expected_revision"))
+        if payload.get("sections"):
+            conflict.details["requested_sections"] = payload["sections"]
+            conflict.details["current_body_excerpt"] = doc.body[:4000]
+        raise conflict
+    fields = dict(payload.get("fields", {}))
+    allowed = {"title", "summary", "aliases", "tags", "sources", "dependencies", "related_modules",
+               "business_rules", "invariants", "consumers"}
+    if set(fields) - allowed:
+        raise ValueError("Unsupported patch fields: " + ", ".join(sorted(set(fields) - allowed)))
+    body = doc.body
+    for section in payload.get("sections", []):
+        lines = body.splitlines(keepends=True)
+        headings = []
+        fence = None
+        for i, line in enumerate(lines):
+            fenced = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+            if fenced:
+                marker = fenced[1]
+                if fence is None:
+                    fence = marker
+                elif marker[0] == fence[0] and len(marker) >= len(fence):
+                    fence = None
+                continue
+            match = re.match(r"^(#{1,6})\s+(.+?)\s*#*\s*$", line) if fence is None else None
+            if match:
+                headings.append((i, len(match[1]), match[2]))
+        matches = [h for h in headings if h[2] == section["heading"]]
+        if len(matches) != 1:
+            raise ValueError(f"Section '{section['heading']}' must match exactly one ATX heading; found {len(matches)}")
+        start, level, _ = matches[0]
+        end = next((i for i, depth, _ in headings if i > start and depth <= level), len(lines))
+        content = str(section["body"])
+        body = "".join(lines[:start + 1]) + "\n" + content.rstrip("\r\n") + "\n\n" + "".join(lines[end:])
+    return save_module.__wrapped__(root, {"id": payload["id"], **fields, "body": body}, doc.revision)
+
+
+@writer
+def save_and_verify(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    # Hold one writer lock across the save and optional attestation.
+    if ("sections" in payload or "fields" in payload) and any(k in payload for k in
+            ("body", "title", "summary", "aliases", "tags", "sources", "dependencies", "related_modules", "business_rules", "invariants", "consumers")):
+        raise ValueError("Use either patch fields/sections or save fields/body in one change, not both")
+    operation = patch_module if "sections" in payload or "fields" in payload else save_module
+    result = (operation.__wrapped__(root, payload) if operation is patch_module else
+              operation.__wrapped__(root, payload, payload.get("expected_revision")))
+    if payload.get("verify", False):
+        try:
+            verified = verify_module.__wrapped__(root, str(payload["id"]), result["revision"])
+            result.update({k: v for k, v in verified.items() if k not in ("changed", "module_id")})
+        except (ValueError, OSError) as exc:
+            result.update({"verified": False, "verification_error": str(exc)})
+    else:
+        result["verified"] = module_status(root, get_module(root, str(payload["id"])))['document_verification']['state'] == "VERIFIED"
+    return result
+
+
+@writer
 def import_bundle(root: Path, source: Path, replace: bool = False) -> dict[str, Any]:
     candidates = sorted(source.rglob("*.md")) if source.is_dir() else [source]
     parsed: list[Document] = []
