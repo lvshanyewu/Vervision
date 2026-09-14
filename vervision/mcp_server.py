@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .formats import markdown_headings, read_sections
 from .core import (
     continuation_documents, get_document, get_module, module_status, resolve_task,
     save_continuation, save_module, search, select_project, verify_module,
@@ -33,17 +34,17 @@ def _workspace_properties() -> dict[str, Any]:
 TOOLS = [
     {"name": "resolve", "description": "Start here. Locate the correct project and return minimal relevant context, freshness, sources, constraints, dependencies and exact next calls.",
      "inputSchema": {"type": "object", "properties": {"task": {"type": "string"}, "detail": {"type": "string", "enum": ["concise", "detailed"], "default": "concise"}, **_workspace_properties()}, "required": ["task"]}},
-    {"name": "search", "description": "Search all handoff document types. Every result includes the exact handoff_get call that reads it.",
+    {"name": "search", "description": "Search all handoff document types; exact registered file paths/names rank first. Each result includes a typed reader call for metadata and headings.",
      "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, **_workspace_properties()}, "required": ["query"]}},
     {"name": "handoff_get", "description": "Unified reader for overview, module and continuation documents returned by resolve/search.",
      "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "type": {"type": "string", "enum": ["overview", "module", "continuation"]}, "full": {"type": "boolean"}, **_workspace_properties()}, "required": ["id"]}},
-    {"name": "module_status", "description": "Check source freshness and the independent handoff semantic verification state; list resolved and missing source paths.",
+    {"name": "module_status", "description": "Check source freshness and independent semantic verification. changed_sources lists added/modified/removed paths since verification; null means no per-file baseline, not no changes. External observations remain in continuations.",
      "inputSchema": {"type": "object", "properties": {"module_id": {"type": "string"}, **_workspace_properties()}, "required": ["module_id"]}},
     {"name": "module_save", "description": "Create or partially update a module. Existing modules require expected_revision; omitted fields are preserved and explicit empty arrays clear fields.",
      "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "title": {"type": "string"}, "summary": {"type": "string"}, "aliases": {"type": "array", "items": {"type": "string"}}, "tags": {"type": "array", "items": {"type": "string"}}, "sources": {"type": "array", "items": {"type": "string"}}, "dependencies": {"type": "array", "items": {"type": "string"}}, "related_modules": {"type": "array", "items": {"type": "string"}}, "business_rules": {"type": "array", "items": {"type": "string"}}, "invariants": {"type": "array", "items": {"type": "string"}}, "consumers": {"type": "array", "items": {"type": "string"}}, "body": {"type": "string"}, "expected_revision": {"type": "string"}, **_workspace_properties()}, "required": ["id"]}},
     {"name": "module_verify", "description": "Record a FRESH baseline only after comparing the handoff's meaning with current source.",
      "inputSchema": {"type": "object", "properties": {"module_id": {"type": "string"}, "expected_revision": {"type": "string"}, **_workspace_properties()}, "required": ["module_id"]}},
-    {"name": "continuation_save", "description": "Record lightweight cross-session progress and one concrete next action.",
+    {"name": "continuation_save", "description": "Create or partially update temporary progress. Existing continuations require expected_revision from continuation_get or resolve; conflicts return the current revision. Reload affected content before retrying. Omitted fields are preserved.",
      "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "title": {"type": "string"}, "module_id": {"type": "string"}, "status": {"type": "string", "enum": ["open", "blocked", "done"]}, "next_step": {"type": "string"}, "body": {"type": "string"}, **_workspace_properties()}, "required": ["id", "title", "module_id", "status", "next_step"]}},
 ]
 
@@ -66,6 +67,13 @@ TOOLS.extend([
 _continuation = next(t for t in TOOLS if t["name"] == "continuation_save")["inputSchema"]
 _continuation["required"] = ["id"]
 _continuation["properties"].update({"expected_revision": {"type": "string"}, "external_checks": {"type": "array", "items": {"type": "object", "properties": {"service": {"type": "string"}, "status": {"type": "string"}, "evidence": {"type": "string"}, "checked_at": {"type": "string"}}, "required": ["service", "status", "evidence", "checked_at"], "additionalProperties": False}}})
+
+for tool in TOOLS:
+    if tool["name"] in ("handoff_get", "module_get", "overview_get", "continuation_get", "module_get_many"):
+        tool["description"] += " Default returns metadata and section headings. sections reads selected unique ATX headings (including children); full=true reads the whole document. Linked continuation bodies require continuation_get."
+        tool["inputSchema"]["properties"]["sections"] = {
+            "type": "array", "items": {"type": "string"}, "minItems": 1,
+            "description": "Exact unique ATX heading names; cannot combine with full=true. Batch applies the same selection to each module and reports per-module errors."}
 
 
 def _workspaces(args: dict[str, Any]) -> list[Path]:
@@ -101,6 +109,9 @@ def _root_or_error(args: dict[str, Any], *, task: str = "", document_id: str | N
 
 
 def _call_tool(name: str, args: dict[str, Any]) -> Any:
+    if args.get("sections") and args.get("full") and name in (
+            "handoff_get", "module_get", "overview_get", "continuation_get", "module_get_many"):
+        raise ValueError("Use sections or full=true, not both")
     if name == "resolve":
         selection = _selection(args, task=str(args["task"]))
         if not selection.get("selected"):
@@ -132,7 +143,8 @@ def _call_tool(name: str, args: dict[str, Any]) -> Any:
         results = []
         for document_id in ids:
             try:
-                value = call_tool("module_get", {"project": str(root), "id": document_id, "full": args.get("full", False)})
+                value = call_tool("module_get", {"project": str(root), "id": document_id,
+                                  **{k: args[k] for k in ("full", "sections") if k in args}})
                 value.pop("project_selection", None)
                 results.append(value)
             except Exception as exc:
@@ -143,12 +155,16 @@ def _call_tool(name: str, args: dict[str, Any]) -> Any:
         root, selection = _root_or_error(args, document_id=document_id)
         doc = get_document(root, document_id, args.get("type") or (name.removesuffix("_get") if name != "handoff_get" else None))
         value = {**doc.meta, "revision": doc.revision, "path": str(doc.path), "project_selection": selection}
+        value["sections"] = [heading for _, _, heading in markdown_headings(doc.body)]
         if doc.meta.get("type") == "module":
             value["freshness"] = module_status(root, doc)
-            value["continuations"] = [{**d.meta, "body": d.body} for d in continuation_documents(root)
+            value["continuations"] = [{k: d.meta.get(k) for k in ("id", "title", "status")}
+                                      for d in continuation_documents(root)
                                       if d.meta.get("module_id") == doc.meta.get("id")]
         if args.get("full", False):
             value["body"] = doc.body
+        elif args.get("sections"):
+            value["body"] = read_sections(doc.body, args["sections"])
         return value
     document_id = str(args.get("module_id") or args.get("id") or "")
     root, _ = _root_or_error(args, document_id=document_id or None)
@@ -195,7 +211,7 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
         return result
     if name == "resolve":
         for item in result.get("matches", []):
-            item.pop("match_reason", None)
+            item["match_reason"].pop("snippet", None)
             item.pop("source_patterns", None)
             item.pop("consumers", None)
             item["freshness"] = {"source_freshness": item["freshness"]["state"],
@@ -207,7 +223,7 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
             result["source_freshness"] = result["freshness"]["state"]
             result["document_verification"] = result["freshness"]["document_verification"]["state"]
             result["external_checks"] = "NOT_CHECKED"
-        return {k: v for k, v in result.items() if k in ("id", "type", "title", "summary", "revision", "status", "next_step", "module_id", "external_checks", "source_freshness", "document_verification")}
+        return {k: v for k, v in result.items() if k in ("id", "type", "title", "summary", "revision", "status", "next_step", "module_id", "external_checks", "source_freshness", "document_verification", "sections", "sources", "continuations", "body", "path")}
     if name == "module_save_many":
         result["results"] = [_compact_write(item) for item in result["results"]]
     if name in ("module_save", "module_patch", "module_verify", "module_save_and_verify", "continuation_save"):

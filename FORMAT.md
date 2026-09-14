@@ -29,12 +29,17 @@
 - `verified_at`：完成语义核对的时间。
 - `verified_digest`：当时所有关联源码的内容指纹。
 - `verified_document_digest`：当时交接正文和业务字段的语义核验指纹；工具维护的时间与核验字段不参与计算。
+- `source_fingerprints`：仅本机核验记录保存的逐文件内容哈希，用于 `module_status.changed_sources` 的 added/modified/removed 文件级证据。没有该基线时返回 null，不猜测变化；旧基线在下一次显式语义核验时升级。
 
 任何模块正文或字段被编辑后，都应重新进行语义核对并运行 `handoff verify <id>`。单纯刷新核验时间不能证明内容正确。旧文档只有源码基线而没有语义核验指纹时，会显示 `UNKNOWN_LEGACY`，直到下一次人工核验。
 
 `revision` 是文档文件的内容版本，源码指纹与核验状态分别存储。重复 save/verify 不改变文件；verify 的 `changed=false` 表示 Markdown 没有变化，`verification_changed` 表示本机基线是否变化。删除索引或换机器会失去本机核验记录，需要重新核对；Markdown 知识不会丢失。普通 reindex 保留 verification 表。
 
-continuation 支持可选 `external_checks` 数组，每项包含 `service`、`status`、`evidence`、`checked_at`，是 Agent 提供的有时间范围的观察记录，不是工具自动探测结果。更新 continuation 必须携带 `expected_revision`，省略字段保留，可只改 `status=done`。模块保存识别临时进度措辞时会提示转用 continuation；版本号、APK 哈希、测试数量与发布历史应记录在 CHANGELOG 或发布记录，长期模块只保留设计和约束。
+continuation 支持可选 `external_checks` 数组，每项包含 `service`、`status`、`evidence`、`checked_at`，是 Agent 提供的有时间范围的观察记录，不是工具自动探测结果。更新 continuation 必须携带 `expected_revision`，省略字段保留，可只改 `status=done`。Agent 判断内容属于长期知识还是临时进度，工具不按关键词猜测；版本号、APK 哈希、测试数量与发布历史应记录在 CHANGELOG 或发布记录，长期模块只保留设计和约束。
+
+根目录或其他位置已有原文时，模块可只保留一句导航摘要、相关 aliases/tags 和 `sources: ["原文路径"]`，不复制全文。`dependencies` 表示必要模块依赖，不应被用作强制所有任务加载设计哲学的开关。阶段性任务文档用 continuation 引用路径；完成后标记 done，历史约束不自动提升为当前规则。读取模块时 continuation 仅返回 id/title/status，正文需独立读取。
+
+读取工具默认返回 metadata、来源模式和 `sections` 标题列表。按需传入 `sections=["标题"]` 可读取唯一 ATX 标题及其子章节，或显式 `full=true` 读取该文档全文。代码围栏中的标题不参与选择；缺失或重复标题报错；父子选择重叠时不重复输出。此读取机制不要求更改 Markdown schema。
 
 ## 状态语义
 

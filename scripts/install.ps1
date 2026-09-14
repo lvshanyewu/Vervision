@@ -12,6 +12,9 @@ if (-not (Test-Path -LiteralPath $sourceExe)) {
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 Copy-Item -LiteralPath $sourceExe -Destination (Join-Path $InstallDir "vervision.exe") -Force
+Copy-Item -LiteralPath (Join-Path $scriptRoot "start-vervision.cmd") -Destination $InstallDir -Force
+New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir "scripts") | Out-Null
+Copy-Item -LiteralPath (Join-Path $scriptRoot "scripts\start-vervision.ps1") -Destination (Join-Path $InstallDir "scripts") -Force
 Copy-Item -LiteralPath (Join-Path $scriptRoot "templates") -Destination $InstallDir -Recurse -Force
 if (Test-Path -LiteralPath (Join-Path $scriptRoot "assets")) {
   Copy-Item -LiteralPath (Join-Path $scriptRoot "assets") -Destination $InstallDir -Recurse -Force
@@ -29,10 +32,10 @@ if (-not $NoShellIntegration) {
   $startMenu = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
   $shell = New-Object -ComObject WScript.Shell
   $shortcut = $shell.CreateShortcut((Join-Path $startMenu "Vervision.lnk"))
-  $shortcut.TargetPath = Join-Path $InstallDir "vervision.exe"
-  $shortcut.Arguments = "gui"
-  $shortcut.WorkingDirectory = $env:USERPROFILE
-  $shortcut.Description = "Vervision project handoff manager"
+  $shortcut.TargetPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+  $shortcut.Arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + (Join-Path $InstallDir "scripts\start-vervision.ps1") + '"'
+  $shortcut.WorkingDirectory = $InstallDir
+  $shortcut.Description = "Vervision read-only project browser"
   $shortcut.Save()
 }
 

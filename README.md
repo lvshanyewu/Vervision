@@ -12,7 +12,7 @@ V1 不调用大模型，不需要在线服务，也不把 Markdown 锁进数据�
 
 ### Windows 安装包
 
-解压 `Vervision-0.3.0-windows-x64.zip`，进入解压后的文件夹，在 PowerShell 中执行：
+解压 `Vervision-0.4.1-windows-x64.zip`，进入解压后的文件夹，在 PowerShell 中执行：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
@@ -28,7 +28,19 @@ codex mcp add vervision -- "$env:LOCALAPPDATA\Programs\Vervision\vervision.exe" 
 
 安装程序把应用放入 `%LOCALAPPDATA%\Programs\Vervision`，不会复制或上传任何项目数据。`uninstall.ps1` 只删除程序和开始菜单快捷方式，保留所有项目中的 `.handoff` 以及本地索引数据。
 
-浏览器中的 `http://127.0.0.1:8765/` 只有在 Vervision 进程运行时才能访问。在源码目录双击 `启动 Vervision.cmd`，或在解压后的安装包中双击 `start-vervision.cmd`；脚本会自动寻找程序、启动本地服务，并在服务就绪后打开浏览器。重复双击时会直接打开已经运行的页面。
+在源码目录双击 `启动 Vervision.cmd`，或在解压后的安装包中双击 `start-vervision.cmd`。脚本会启动服务并打开实际可用的地址；8765 被占用或被 Windows 保留时自动选择其他可用端口，不需要管理员权限或更改系统端口设置。重复双击会复用同版本服务，顶部显示实际运行版本。请使用脚本打开的地址，而不是固定访问 8765。
+
+启动状态保存在 `%LOCALAPPDATA%\Vervision\logs\webui-8765.json`，包含实际 URL；日志为同目录的 `webui.log` 和 `webui-error.log`。脚本核对专用健康接口和版本，启动失败时直接显示退出码与错误摘要。
+
+### 在浏览器中阅读项目
+
+1. 从左侧“我的项目”选择自动发现的项目，或在“打开其他项目”中输入项目文件夹路径后点击“打开”。也可输入 `.handoff` 文件夹本身的路径。
+2. 选择概览、模块知识、进行中的任务或历史记录；搜索框可搜索文件标题、路径和正文。
+3. 点击文档中的项目内 Markdown 链接可阅读原文；模块的“来源与核验详情”默认折叠。
+
+已有交接文件无需先执行 init 或登记项目。即使没有 overview 或规范 frontmatter，也可以阅读 `.handoff` 内现有的 Markdown。没有交接目录时页面会明确提示，选择另一个项目即可。最近打开的路径只记在当前浏览器中。
+
+WebUI 是只读阅读器，不提供新建、编辑、删除、归档、导入或核验写入；浏览器 API 同样拒绝写操作。深浅主题使用暖色中性背景、黑白主按钮及低饱和状态标签。CLI/MCP 仍提供 Agent 所需的维护能力。
 
 ### 从源码安装
 
@@ -80,7 +92,7 @@ handoff reindex
 handoff gui
 ```
 
-GUI 默认在 `http://127.0.0.1:8765` 打开。它可以查看、搜索、新建、编辑、核验和归档模块。归档不会直接删除文件，而是移动到 `.handoff/archive/`。
+以上初始化步骤用于创建新交接，而不是浏览已有项目的前置条件。GUI 只读取文件；创建、修改和核验仍由 Agent 通过 CLI/MCP 或直接维护 Markdown 完成。
 
 完整格式与外部文字 AI 的导入规则见 [FORMAT.md](FORMAT.md)，可以直接把 `templates/` 中的三份模板交给其他 Agent。
 
@@ -122,12 +134,12 @@ codex mcp add vervision -- python -m vervision mcp
 
 第二种方式要求 Codex 启动 MCP 时的 Python 能找到已安装的 `vervision` 包。命令格式已按当前 Codex CLI 的 `mcp add` 帮助核对；也可以通过 `codex mcp list` 确认配置。
 
-MCP 默认返回 `structuredContent`，文本区只有短提示，不重复嵌套大段 JSON。读取默认不含正文，使用 `full=true` 获取全文和诊断；客户端须支持结构化工具结果。接口如下：
+MCP 默认返回 `structuredContent`，文本区只有短提示，不重复嵌套大段 JSON。读取默认返回 metadata 和 ATX 章节标题；`sections=["当前实现"]` 按标题读取正文（包含子章节），`full=true` 获取单份文档全文和诊断，二者不能同时使用。客户端须支持结构化工具结果。接口如下：
 
 - `resolve`：返回会话 `scope_id`、架构摘要、相关模块 revision、约束与下一步批量读取参数。显式项目优先，其次工作区包含关系；无法明确定位且有多个候选时拒绝自动选择，关键词和文档 ID 不再触发跨项目选择。`detail=detailed` 返回检索诊断。scope 绑定当前 MCP 服务会话，重启后重新 resolve；scope 与显式 project/workspace 冲突会拒绝调用。
-- `search`：搜索全部文档类型，附带正式的 `module_get`、`overview_get` 或 `continuation_get` 参数。标题、别名、标签、来源和依赖高于正文，正文得分封顶并过滤常见版本流水行。resolve 区分 `modify`（建议修改）、`read`（建议读取）、依赖摘要的 `related`（仅关联）；建议不代表必须更新。
+- `search`：搜索全部文档类型，附带正式的 `module_get`、`overview_get` 或 `continuation_get` 参数，默认先读摘要与标题。标题、别名、标签、来源和依赖高于正文，正文得分封顶并过滤常见版本流水行。英文关键词按词边界匹配，避免 ui 命中 build。精确登记的文件路径/文件名优先于泛关键词；resolve 存在精确模块命中时只返回这些模块，仍最多三个。resolve 区分 `modify`（建议修改）、`read`（建议读取）、依赖摘要的 `related`（仅关联）；建议不代表必须更新。
 - `module_get`、`overview_get`、`continuation_get`：明确类型的读取接口；`handoff_get` 保留兼容。
-- `module_get_many`：一次读取 `ids`，最多 50 个，失败项单独报告，项目选择信息不逐项重复。
+- `module_get_many`：一次读取 `ids`，最多 50 个，失败项单独报告，项目选择信息不逐项重复。`sections` 对每份模块使用相同的标题选择；不同标题宜分别读取。标题必须唯一，重复或不存在时明确报错。不会静默截断正文；很大的章节仍可选择更细的子标题或直接查看原文件。
 - `module_status`：单独检查 Freshness。
 - `module_save`：新增或部分更新模块；更新已有模块必须使用 `expected_revision`，省略字段保留、显式空数组清空。无变化保存不会重写文件。
 - `module_patch`：携带 `id`、`expected_revision`，用 `fields` 部分更新元数据，用 `sections: [{heading, body}]` 替换 Markdown 标题下内容。标题保留，替换范围包含其子标题；同名标题、缺失标题报错，代码围栏内的标题忽略。不支持 Setext 标题和任意 JSON Patch，避免多套修改语法。
@@ -138,7 +150,11 @@ MCP 默认返回 `structuredContent`，文本区只有短提示，不重复嵌�
 
 所有接口均接受 `scope_id`，无需重复 project/workspace。冲突返回当前 revision、请求与当前字段差异，以及最多 4000 字符的正文差异；不会自动覆盖冲突，也不会假称掌握旧版本全文。
 
-典型开发流程缩短为 `resolve → module_get_many(full=true) → module_save_many`，多个模块的核验可合并到最后一次调用。已有充分上下文时可直接使用 resolve 返回的 revision 进行字段或段落 patch。单纯补传 APK 的任务通常只更新 continuation，长期规则真正改变时才更新模块。
+典型开发流程为 `resolve → module_get_many（摘要、来源路径、章节标题）→ 按需 sections 或直接查看源码 → 修改`。resolve/search 不再建议默认加载全文；已有足够证据时可以跳过读取，直接使用 revision 做字段或段落 patch。模块全文也只附带 continuation 的 id/title/status，历史正文须显式 continuation_get，避免旧指令混入当前上下文。单纯补传 APK 的任务通常只更新 continuation，长期规则真正改变时才更新模块。
+
+`module_status.changed_sources` 列出核验以来 added/modified/removed 的相对文件路径，不提供 diff 或推测过期章节。没有逐文件基线时返回 null（未知），已建立基线且无变化时为 []；下一次完成语义核对后的 verify 会补齐旧基线。它反映登记来源集合的变化，包括 sources 配置调整，不等同于 Git 工作区状态。外部验证仍通过 continuation 的 external_checks 显式读取，不将过去某环境的结果当作模块当前状态。
+
+本项目的设计哲学唯一原文是根目录 [ZEN.md](ZEN.md)。`.handoff/modules/design-philosophy.md` 仅用现有 aliases/tags/sources 为重大设计决策导航，不复制原文，也不成为所有模块的依赖。其他外部文档也可用现有来源路径登记；临时任务说明可在 continuation 的标题、next_step 和正文中引用原路径，再用 search 定位，不需要新建 task_note 类型。已完成 continuation 是历史记录，不是当前用户指令。
 
 ```json
 {"scope_id":"<resolve 返回值>","changes":[{"id":"release-engineering","expected_revision":"<revision>","sections":[{"heading":"发布渠道","body":"稳定的上传规则。"}],"verify":true}]}

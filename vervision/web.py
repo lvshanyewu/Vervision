@@ -1,47 +1,59 @@
 from __future__ import annotations
 
+import errno
 import json
 import mimetypes
-import time
+import os
 import urllib.parse
 import webbrowser
-from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .core import (
-    _load_registry, archive_module, continuation_documents, get_module, import_bundle,
-    module_documents, module_status, rebuild_index, resolve_project, resolve_task,
-    save_continuation, save_module, search, source_inventory, validate_project, verify_module,
-)
+from .core import _load_registry, discover_projects, module_status
 from .formats import parse_document
 
 
 STATIC = Path(__file__).with_name("static")
-STATUS_CACHE: dict[tuple[str, str], tuple[float, str, dict[str, Any]]] = {}
-CACHE_SECONDS = 30
 
 
-def _module_json(
-    root: Path, module_id: str, full: bool = True, inventory: list[Path] | None = None,
-) -> dict[str, Any]:
-    doc = get_module(root, module_id)
-    key = (str(root), module_id)
-    cached = STATUS_CACHE.get(key)
-    if inventory is not None:
-        status = module_status(root, doc, inventory)
-        STATUS_CACHE[key] = (time.monotonic(), doc.revision, status)
-    elif cached and cached[1] == doc.revision and time.monotonic() - cached[0] < CACHE_SECONDS:
-        status = cached[2]
-    else:
-        status = module_status(root, doc)
-        STATUS_CACHE[key] = (time.monotonic(), doc.revision, status)
-    result = {**doc.meta, "freshness": status, "revision": doc.revision,
-              "path": str(doc.path)}
-    if full:
-        result["body"] = doc.body
+def browse_root(project: str) -> Path:
+    """Open an existing handoff folder without initializing or registering it."""
+    root = Path(_load_registry().get(project, project) if project else Path.cwd()).expanduser().resolve()
+    if root.name == ".handoff":
+        root = root.parent
+    if not (root / ".handoff").is_dir():
+        raise FileNotFoundError("此文件夹没有 .handoff 交接目录。请选择已有交接文件的项目；浏览器不会创建或修改文件。")
+    return root
+
+
+def markdown_path(root: Path, relative: str) -> Path:
+    path = (root / relative).resolve()
+    if root not in path.parents or path.suffix.lower() != ".md" or not path.is_file():
+        raise FileNotFoundError("找不到项目内的 Markdown 文件。")
+    return path
+
+
+def document_json(root: Path, path: Path, full: bool = False) -> dict[str, Any]:
+    relative = path.relative_to(root).as_posix()
+    try:
+        doc = parse_document(path)
+        result = {**doc.meta, "revision": doc.revision}
+        if full:
+            result["body"] = doc.body
+            if doc.meta.get("type") == "module":
+                try:
+                    result["freshness"] = module_status(root, doc)
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    result["notice"] = f"正文可读，来源状态暂不可用：{exc}"
+    except ValueError:
+        text = path.read_text(encoding="utf-8-sig")
+        result = {"title": path.stem, "type": "document", "summary": "Markdown 文档"}
+        if full:
+            result["body"] = text
+    result.update({"path": relative, "archived": "archive" in path.relative_to(root / ".handoff").parts
+                   if root / ".handoff" in path.parents else False})
     return result
 
 
@@ -57,128 +69,97 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(data)
-
-    def _error(self, exc: Exception, status: int = 400) -> None:
-        self._json({"error": str(exc)}, status)
-
-    def _body(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0"))
-        return json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
-
-    def _root(self, query: dict[str, list[str]], body: dict[str, Any] | None = None) -> Path:
-        project = (body or {}).get("project") or query.get("project", [None])[0]
-        return resolve_project(project)
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
-        if parsed.path == "/api/projects":
-            return self._json([{"id": key, "path": value} for key, value in _load_registry().items()])
-        if parsed.path == "/api/modules":
-            try:
-                root = self._root(query)
-                documents = module_documents(root)
-                patterns = [pattern for doc in documents for pattern in doc.meta.get("sources", [])]
-                inventory = source_inventory(root, patterns)
-                modules = [_module_json(root, str(d.meta["id"]), False, inventory) for d in documents]
-                return self._json({"project": str(root), "modules": modules,
-                                   "continuations": len([d for d in continuation_documents(root) if d.meta.get("status") != "done"])})
-            except Exception as exc:
-                return self._error(exc, 404)
-        if parsed.path == "/api/overview":
-            try:
-                root = self._root(query)
-                doc = parse_document(root / ".handoff" / "overview.md")
-                return self._json({**doc.meta, "body": doc.body, "revision": doc.revision, "path": str(doc.path)})
-            except Exception as exc:
-                return self._error(exc, 404)
-        if parsed.path.startswith("/api/modules/"):
-            try:
-                root = self._root(query)
-                module_id = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1])
-                data = _module_json(root, module_id)
-                data["continuations"] = [
-                    {**d.meta, "body": d.body, "revision": d.revision}
-                    for d in continuation_documents(root) if d.meta.get("module_id") == module_id
-                ]
-                return self._json(data)
-            except Exception as exc:
-                return self._error(exc, 404)
-        if parsed.path == "/api/search":
-            try:
-                root = self._root(query)
-                return self._json(search(root, query.get("q", [""])[0]))
-            except Exception as exc:
-                return self._error(exc, 404)
-        if parsed.path == "/api/validate":
-            try:
-                root = self._root(query)
-                errors = validate_project(root)
-                return self._json({"valid": not errors, "errors": errors})
-            except Exception as exc:
-                return self._error(exc, 404)
-        name = "index.html" if parsed.path in ("", "/") else parsed.path.lstrip("/")
-        target = (STATIC / name).resolve()
-        if STATIC.resolve() not in target.parents and target != STATIC.resolve():
-            return self.send_error(HTTPStatus.NOT_FOUND)
-        if not target.is_file():
-            return self.send_error(HTTPStatus.NOT_FOUND)
-        data = target.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", mimetypes.guess_type(target.name)[0] or "application/octet-stream")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            if parsed.path == "/api/health":
+                return self._json({"service": "vervision", "version": __version__, "read_only": True})
+            if parsed.path == "/api/projects":
+                return self._json(discover_projects())
+            if parsed.path == "/api/documents":
+                root = browse_root(query.get("project", [""])[0])
+                documents = []
+                warnings = []
+                for candidate in sorted((root / ".handoff").rglob("*.md")):
+                    try:
+                        path = markdown_path(root, candidate.relative_to(root).as_posix())
+                        item = document_json(root, path)
+                        keyword = query.get("q", [""])[0].strip().casefold()
+                        if not keyword or keyword in (json.dumps(item, ensure_ascii=False) + path.read_text(encoding="utf-8-sig")).casefold():
+                            documents.append(item)
+                    except (OSError, ValueError) as exc:
+                        warnings.append(f"{candidate.name}: {exc}")
+                overview = next((d for d in documents if d["path"] == ".handoff/overview.md"), {})
+                return self._json({"project": str(root), "title": overview.get("title", root.name),
+                                   "documents": documents, "warnings": warnings})
+            if parsed.path == "/api/document":
+                root = browse_root(query.get("project", [""])[0])
+                path = markdown_path(root, query.get("path", [""])[0])
+                return self._json(document_json(root, path, full=True))
+            if parsed.path.startswith("/api/"):
+                return self._json({"error": "接口不存在。"}, 404)
+            name = "index.html" if parsed.path in ("", "/") else parsed.path.lstrip("/")
+            target = (STATIC / name).resolve()
+            if STATIC.resolve() not in target.parents or not target.is_file():
+                return self.send_error(404)
+            data = target.read_bytes()
+            self.send_response(200)
+            content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+            self.send_header("Content-Type", content_type + "; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+        except (OSError, ValueError, KeyError) as exc:
+            self._json({"error": str(exc)}, 404)
 
     def do_POST(self) -> None:
-        parsed = urllib.parse.urlparse(self.path)
-        query = urllib.parse.parse_qs(parsed.query)
-        try:
-            body = self._body()
-            root = self._root(query, body)
-            if parsed.path == "/api/modules":
-                return self._json(save_module(root, body, body.get("expected_revision")), 201)
-            if parsed.path.endswith("/verify") and parsed.path.startswith("/api/modules/"):
-                module_id = urllib.parse.unquote(parsed.path.split("/")[-2])
-                result = verify_module(root, module_id, body.get("expected_revision"))
-                STATUS_CACHE.pop((str(root), module_id), None)
-                return self._json(result)
-            if parsed.path == "/api/continuations":
-                return self._json(save_continuation(root, body), 201)
-            if parsed.path == "/api/resolve":
-                return self._json(resolve_task(root, str(body.get("task", "")),
-                                               detail=str(body.get("detail", "concise"))))
-            if parsed.path == "/api/import":
-                return self._json(import_bundle(root, Path(str(body["path"])), bool(body.get("replace"))))
-            if parsed.path == "/api/reindex":
-                return self._json(rebuild_index(root))
-            return self.send_error(HTTPStatus.NOT_FOUND)
-        except Exception as exc:
-            return self._error(exc)
+        self._json({"error": "WebUI 仅供阅读，不提供编辑、初始化或核验写入。"}, 405)
 
-    def do_DELETE(self) -> None:
-        parsed = urllib.parse.urlparse(self.path)
-        query = urllib.parse.parse_qs(parsed.query)
-        try:
-            root = self._root(query)
-            if parsed.path.startswith("/api/modules/"):
-                module_id = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1])
-                expected = self.headers.get("If-Match")
-                return self._json(archive_module(root, module_id, expected))
-            return self.send_error(HTTPStatus.NOT_FOUND)
-        except Exception as exc:
-            return self._error(exc)
+    do_DELETE = do_POST
+    do_PUT = do_POST
+    do_PATCH = do_POST
 
 
-def serve(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True) -> None:
-    server = ThreadingHTTPServer((host, port), Handler)
-    url = f"http://{host}:{port}"
-    print(f"Vervision is running at {url}")
-    if open_browser:
-        webbrowser.open(url)
+class ReaderServer(ThreadingHTTPServer):
+    # HTTPServer enables SO_REUSEADDR, which can share an occupied port on Windows.
+    allow_reuse_address = False
+
+
+def create_server(host: str, port: int) -> ThreadingHTTPServer:
     try:
+        return ReaderServer((host, port), Handler)
+    except OSError as exc:
+        if not port or (exc.errno not in (errno.EACCES, errno.EADDRINUSE)
+                        and getattr(exc, "winerror", None) not in (10013, 10048)):
+            raise
+        print(f"Port {port} is unavailable ({exc}); selecting an available port.", flush=True)
+        return ReaderServer((host, 0), Handler)
+
+
+def serve(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True,
+          ready_file: Path | None = None) -> None:
+    server = create_server(host, port)
+    url = f"http://{host}:{server.server_port}/"
+    try:
+        if ready_file:
+            ready_file.parent.mkdir(parents=True, exist_ok=True)
+            temporary = ready_file.with_suffix(f".{os.getpid()}.tmp")
+            try:
+                temporary.write_text(json.dumps({"service": "vervision", "version": __version__,
+                                                 "url": url, "pid": os.getpid()}), encoding="utf-8")
+                temporary.replace(ready_file)
+            finally:
+                temporary.unlink(missing_ok=True)
+        print(f"Vervision {__version__} is running at {url}", flush=True)
+        if open_browser:
+            webbrowser.open(url)
         server.serve_forever()
     except KeyboardInterrupt:
         pass

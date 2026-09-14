@@ -37,6 +37,8 @@ if (Test-Path -LiteralPath (Join-Path $projectRoot "assets\icon.png")) {
   Copy-Item -LiteralPath (Join-Path $projectRoot "assets\icon.png") -Destination (Join-Path $releaseDir "assets")
 }
 Copy-Item -LiteralPath (Join-Path $projectRoot "FORMAT.md") -Destination $releaseDir
+Copy-Item -LiteralPath (Join-Path $projectRoot "ZEN.md") -Destination $releaseDir
+Copy-Item -LiteralPath (Join-Path $projectRoot "CHANGELOG.md") -Destination $releaseDir
 Compress-Archive -LiteralPath $releaseDir -DestinationPath (Join-Path $projectRoot "dist\Vervision-$releaseVersion-windows-x64.zip") -Force
 $versionedExe = Join-Path $projectRoot "dist\vervision-$releaseVersion.exe"
 try {

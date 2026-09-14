@@ -3,57 +3,39 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="description" content="Vervision 本地项目交接与上下文管理工具">
+  <meta name="description" content="Vervision 本地项目交接阅读器">
   <title>Vervision · 项目交接</title>
-  <link rel="stylesheet" href="app.css">
-  <script>(function(){var t=localStorage.getItem('vervision-theme')||'system';if(t==='system')t=matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light';document.documentElement.dataset.theme=t})();</script>
+  <link rel="stylesheet" href="/app.css">
+  <script>try{document.documentElement.dataset.theme=localStorage.getItem('vervision-theme')||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light')}catch(e){}</script>
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><strong>Vervision</strong></div>
+    <a class="brand" href="/">Vervision <span id="version">本地阅读器</span></a>
     <div class="top-actions">
-      <label class="project-picker"><span>项目</span><select id="projectSelect" aria-label="选择项目"></select></label>
-      <button class="icon-btn" id="validateBtn" title="校验项目" aria-label="校验项目">✓</button>
-      <button class="icon-btn" id="themeBtn" title="切换主题" aria-label="切换主题">◐</button>
+      <span class="readonly">只读浏览</span>
+      <button id="refreshBtn" class="secondary" title="重新读取项目文件">刷新</button>
+      <button id="themeBtn" class="icon-btn" aria-label="切换深浅主题" title="切换深浅主题">◐</button>
     </div>
   </header>
-
   <main class="workspace">
     <aside class="sidebar">
-      <div class="search-box"><span>⌕</span><input id="searchInput" type="search" placeholder="搜索模块、别名或正文"></div>
-      <div class="side-head"><span>功能模块</span><button id="newBtn" class="text-btn">＋ 新建</button></div>
-      <nav id="moduleList" class="module-list" aria-label="功能模块"></nav>
-      <div class="side-foot"><span id="moduleCount">0 个模块</span><span id="openCount">0 项未完成</span></div>
+      <label class="field-label" for="projectSelect">我的项目</label>
+      <select id="projectSelect" aria-label="选择项目"><option value="">选择已有项目</option></select>
+      <form id="openForm" class="open-form">
+        <label class="field-label" for="pathInput">打开其他项目</label>
+        <div class="path-control"><input id="pathInput" required placeholder="D:\your-project" aria-label="项目文件夹路径" autocomplete="off"><button class="primary" type="submit">打开</button></div>
+        <p class="hint">输入项目或 .handoff 文件夹路径，无需登记。</p>
+      </form>
+      <div id="projectPath" class="project-path"></div>
+      <label class="search-box"><span aria-hidden="true">⌕</span><input id="searchInput" type="search" aria-label="搜索交接文件" placeholder="搜索标题、路径或正文" disabled></label>
+      <nav id="documentList" aria-label="交接文件"></nav>
+      <div class="side-foot"><span id="documentCount">本地文件 · 按需读取</span></div>
     </aside>
-
-    <section class="content" id="content">
-      <div class="empty-state"><div class="empty-mark">V</div><h1>选择一个模块</h1><p>查看项目交接、来源状态和语义核验情况。</p></div>
+    <section class="content" id="content" aria-live="polite">
+      <div class="empty-state"><span class="empty-mark">V</span><p class="eyebrow">你的项目，原地阅读</p><h1>打开一份项目交接</h1><p>选择左侧项目，或输入项目文件夹路径。<br>概览、模块知识与任务记录，都在这里。</p><p class="hint">文件留在本机，阅读不会修改项目。</p></div>
     </section>
   </main>
-
-  <dialog id="editorDialog" class="editor-dialog">
-    <form id="editorForm" method="dialog">
-      <header><div><small id="editorEyebrow">MODULE</small><h2 id="editorTitle">新建模块</h2></div><button type="button" class="icon-btn" data-close aria-label="关闭">×</button></header>
-      <div class="form-grid">
-        <label>ID<input name="id" required pattern="[a-z0-9._-]+" placeholder="essay-quickref"></label>
-        <label>标题<input name="title" required></label>
-        <label class="wide">一句话摘要<input name="summary" required></label>
-        <label>别名，逗号分隔<input name="aliases"></label>
-        <label>标签，逗号分隔<input name="tags"></label>
-        <label class="wide">源文件，每行一个路径或 glob<textarea name="sources" rows="4" required></textarea></label>
-        <label>依赖模块，逗号分隔<input name="dependencies"></label>
-        <label>关联模块，逗号分隔<input name="related_modules"></label>
-        <label class="wide">关键业务口径，每行一条<textarea name="business_rules" rows="3"></textarea></label>
-        <label class="wide">不可破坏约束，每行一条<textarea name="invariants" rows="3"></textarea></label>
-        <label class="wide">跨模块消费者，每行一条<textarea name="consumers" rows="3"></textarea></label>
-        <label class="wide">Hand-off 正文（Markdown）<textarea name="body" rows="14"></textarea></label>
-      </div>
-      <input type="hidden" name="expected_revision">
-      <footer><button type="button" class="secondary" data-close>取消</button><button type="submit" class="primary">保存模块</button></footer>
-    </form>
-  </dialog>
-
   <div id="toast" class="toast" role="status"></div>
-  <script src="app.js"></script>
+  <script src="/app.js"></script>
 </body>
 </html>

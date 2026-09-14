@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from contextlib import contextmanager
 
-from .formats import Document, dump_document, parse_document, validate_document
+from .formats import Document, dump_document, parse_document, validate_document, section_bounds
 from .locking import writer
 
 
@@ -307,8 +307,18 @@ def module_status(
     root: Path, doc: Document, inventory: list[Path] | None = None,
     digest_cache: dict[Path, bytes] | None = None,
 ) -> dict[str, Any]:
+    if digest_cache is None:
+        digest_cache = {}
     current, files, missing = source_digest(root, doc.meta.get("sources", []), inventory, digest_cache)
     baseline = verification_baseline(root, doc)
+    fingerprints = {name: digest_cache[root / name].hex() for name in files}
+    previous = baseline.get("source_fingerprints")
+    changed_sources = None if previous is None else [
+        {"path": name, "change": "added" if name not in previous else
+         "removed" if name not in fingerprints else "modified"}
+        for name in sorted(previous.keys() | fingerprints.keys())
+        if previous.get(name) != fingerprints.get(name)
+    ]
     verified = str(baseline.get("verified_digest", ""))
     if not verified:
         state = "UNVERIFIED"
@@ -340,7 +350,7 @@ def module_status(
         "source_freshness": {"state": state, "digest": current},
         "external_checks": {"state": "NOT_CHECKED"},
         "updated_at": doc.meta.get("updated_at"), "source_count": len(files),
-        "sources": files, "missing_sources": missing, "revision": doc.revision,
+        "sources": files, "missing_sources": missing, "changed_sources": changed_sources, "revision": doc.revision,
         "document_verification": {"state": document_state, "reason": document_reason},
     }
 
@@ -372,17 +382,21 @@ def verify_module(root: Path, module_id: str, expected_revision: str | None = No
     doc = get_module(root, module_id)
     if expected_revision and doc.revision != expected_revision:
         raise RevisionConflict(doc, {}, expected_revision)
-    digest, files, missing = source_digest(root, doc.meta.get("sources", []))
+    digest_cache: dict[Path, bytes] = {}
+    digest, files, missing = source_digest(root, doc.meta.get("sources", []), digest_cache=digest_cache)
     if missing:
         raise ValueError("Cannot verify; missing source paths: " + ", ".join(missing))
     semantic = document_semantic_digest(doc.meta, doc.body)
     old = verification_baseline(root, doc)
-    changed = old.get("verified_digest") != digest or old.get("verified_document_digest") != semantic
+    fingerprints = {name: digest_cache[root / name].hex() for name in files}
+    changed = (old.get("verified_digest") != digest or old.get("verified_document_digest") != semantic
+               or old.get("source_fingerprints") != fingerprints)
     verified_at = now_iso() if changed else old.get("verified_at")
     if changed:
         with _verification_db() as db:
             db.execute("INSERT OR REPLACE INTO verification VALUES (?,?,?)", (str(root.resolve()), module_id,
-                       json.dumps({"verified_digest": digest, "verified_document_digest": semantic, "verified_at": verified_at})))
+                       json.dumps({"verified_digest": digest, "verified_document_digest": semantic,
+                                   "verified_at": verified_at, "source_fingerprints": fingerprints})))
     revision = doc.revision
     return {"module_id": module_id, "state": "FRESH", "source_count": len(files),
             "verified_at": verified_at, "revision": revision, "changed": False,
@@ -473,12 +487,19 @@ def rebuild_index(root: Path) -> dict[str, int]:
     return {"documents": len(docs), "modules": len([d for d in docs if d.meta.get("type") == "module"])}
 
 
+def _matches_term(term: str, text: str) -> bool:
+    # Latin keywords must not match fragments such as "ui" in "build".
+    if re.fullmatch(r"[a-z0-9_-]+", term):
+        return bool(re.search(r"(?<![a-z0-9_])" + re.escape(term) + r"(?![a-z0-9_])", text))
+    return term in text
+
+
 def search(
     root: Path, query: str, limit: int = 20, include_next: bool = True,
     documents: list[Document] | None = None,
 ) -> list[dict[str, Any]]:
     lowered = query.lower().strip()
-    terms = [t for t in re.split(r"\s+", lowered) if t]
+    terms = [t for t in re.split(r"[\s,;:!?，；：！？`\"()（）]+", lowered) if t]
     cjk_runs = re.findall(r"[\u3400-\u9fff]+", lowered)
     for run in cjk_runs:
         if len(run) >= 2:
@@ -495,14 +516,24 @@ def search(
                   (" ".join(map(str, doc.meta.get("dependencies", []))).lower(), 8)]
         body = "\n".join(line for line in doc.body.lower().splitlines()
                          if not re.search(r"\b\d+\.\d+\.\d+\b|\b20\d\d[-/]\d|sha256|apk.*hash", line))
-        score = sum(weight for term in terms for text, weight in fields if term in text)
-        score += min(2, sum(1 for term in terms if term in body))
-        if not terms or score:
-            ranked.append((score, doc))
-    ranked.sort(key=lambda item: (-item[0], str(item[1].meta.get("title", ""))))
+        score = sum(weight for term in terms for text, weight in fields if _matches_term(term, text))
+        score += min(2, sum(1 for term in terms if _matches_term(term, body)))
+        paths = [doc.path.relative_to(root).as_posix(), *map(str, doc.meta.get("sources", []))]
+        exact_paths = []
+        for path in paths:
+            normalized = path.replace("\\", "/").lower()
+            if any(c in normalized for c in "*?[") or not Path(normalized).suffix:
+                continue
+            names = (normalized, normalized.rsplit("/", 1)[-1])
+            if any(re.search(r"(?<![a-z0-9_./-])" + re.escape(name) + r"(?![a-z0-9_./-])",
+                             lowered.replace("\\", "/")) for name in names):
+                exact_paths.append(path)
+        if not terms or score or exact_paths:
+            ranked.append((score, doc, exact_paths))
+    ranked.sort(key=lambda item: (not bool(item[2]), -item[0], str(item[1].meta.get("title", ""))))
     project_id = parse_document(root / ".handoff" / "overview.md").meta.get("id")
     results = []
-    for score, doc in ranked[:limit]:
+    for score, doc, exact_paths in ranked[:limit]:
         result = {"id": doc.meta.get("id"), "type": doc.meta.get("type"), "title": doc.meta.get("title"),
                   "summary": doc.meta.get("summary"), "score": score, "revision": doc.revision}
         matched_fields = []
@@ -512,14 +543,16 @@ def search(
                            ("summary", str(doc.meta.get("summary", ""))),
                            ("sources", " ".join(map(str, doc.meta.get("sources", [])))),
                            ("dependencies", " ".join(map(str, doc.meta.get("dependencies", [])))), ("body", doc.body)):
-            if any(term in text.lower() for term in terms):
+            if any(_matches_term(term, text.lower()) for term in terms):
                 matched_fields.append(name)
         result["match_reason"] = {"fields": matched_fields,
                                   "snippet": next((line.strip()[:160] for line in doc.body.splitlines()
-                                                   if any(term in line.lower() for term in terms)), None)}
+                                                   if any(_matches_term(term, line.lower()) for term in terms)), None)}
+        if exact_paths:
+            result["matched_paths"] = exact_paths
         if include_next:
             result["next_action"] = {"tool": f"{doc.meta.get('type')}_get", "arguments": {
-                "project": str(root.resolve()), "id": doc.meta.get("id"), "full": True,
+                "project": str(root.resolve()), "id": doc.meta.get("id"), "full": False,
             }}
         results.append(result)
     return results
@@ -534,8 +567,9 @@ def resolve_task(root: Path, task: str, limit: int = 3, detail: str = "concise")
     ranked = [r for r in search(root, task, max(limit * 3, len(documents)), documents=documents)
               if r["type"] == "module"]
     if ranked:
+        exact = [r for r in ranked if r.get("matched_paths")]
         cutoff = max(3, ranked[0]["score"] * 0.25)
-        results = [r for r in ranked if r["score"] >= cutoff][:limit]
+        results = (exact or [r for r in ranked if r["score"] >= cutoff])[:limit]
     else:
         results = []
     continuations = [d for d in documents if d.meta.get("type") == "continuation"]
@@ -598,7 +632,7 @@ def resolve_task(root: Path, task: str, limit: int = 3, detail: str = "concise")
                                  "architecture": overview.meta.get("architecture_summary", overview.meta.get("summary", ""))},
             "matches": results, "dependency_summaries": dependency_summaries,
             "next_actions": ([{"tool": "module_get_many", "arguments": {"project": str(root.resolve()),
-                                "ids": [r["id"] for r in results], "full": True}}]
+                                "ids": [r["id"] for r in results], "full": False}}]
                              if results else [{"tool": "search", "arguments": {"project": str(root.resolve()), "query": task}}])}
 
 
@@ -652,11 +686,8 @@ def save_module(root: Path, payload: dict[str, Any], expected_revision: str | No
     path.parent.mkdir(parents=True, exist_ok=True)
     _write_document(path, meta, body)
     rebuild_index(root)
-    result = {"id": module_id, "path": str(path), "revision": parse_document(path).revision,
-              "changed": True}
-    if re.search(r"本次|尚未完成|等待|重试|临时失败|下一步|\b(?:retry|pending|next step)\b", body, re.I):
-        result["warnings"] = ["Temporary progress belongs in continuation_save; release facts belong in CHANGELOG/release records."]
-    return result
+    return {"id": module_id, "path": str(path), "revision": parse_document(path).revision,
+            "changed": True}
 
 
 @writer
@@ -739,25 +770,7 @@ def patch_module(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
     body = doc.body
     for section in payload.get("sections", []):
         lines = body.splitlines(keepends=True)
-        headings = []
-        fence = None
-        for i, line in enumerate(lines):
-            fenced = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
-            if fenced:
-                marker = fenced[1]
-                if fence is None:
-                    fence = marker
-                elif marker[0] == fence[0] and len(marker) >= len(fence):
-                    fence = None
-                continue
-            match = re.match(r"^(#{1,6})\s+(.+?)\s*#*\s*$", line) if fence is None else None
-            if match:
-                headings.append((i, len(match[1]), match[2]))
-        matches = [h for h in headings if h[2] == section["heading"]]
-        if len(matches) != 1:
-            raise ValueError(f"Section '{section['heading']}' must match exactly one ATX heading; found {len(matches)}")
-        start, level, _ = matches[0]
-        end = next((i for i, depth, _ in headings if i > start and depth <= level), len(lines))
+        start, end = section_bounds(body, section["heading"])
         content = str(section["body"])
         body = "".join(lines[:start + 1]) + "\n" + content.rstrip("\r\n") + "\n\n" + "".join(lines[end:])
     return save_module.__wrapped__(root, {"id": payload["id"], **fields, "body": body}, doc.revision)

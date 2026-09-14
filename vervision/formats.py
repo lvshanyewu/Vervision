@@ -15,6 +15,45 @@ REQUIRED = {
 }
 
 
+def markdown_headings(body: str) -> list[tuple[int, int, str]]:
+    """ATX headings outside fenced code; shared by section reads and patches."""
+    headings = []
+    fence = None
+    for i, line in enumerate(body.splitlines(keepends=True)):
+        fenced = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if fenced:
+            marker, tail = fenced.groups()
+            if fence is None:
+                fence = marker
+            elif marker[0] == fence[0] and len(marker) >= len(fence) and not tail.strip():
+                fence = None
+            continue
+        match = re.match(r"^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$", line) if fence is None else None
+        if match:
+            headings.append((i, len(match[1]), match[2]))
+    return headings
+
+
+def section_bounds(body: str, heading: str) -> tuple[int, int]:
+    headings = markdown_headings(body)
+    matches = [h for h in headings if h[2] == heading]
+    if len(matches) != 1:
+        raise ValueError(f"Section '{heading}' must match exactly one ATX heading; found {len(matches)}")
+    start, level, _ = matches[0]
+    end = next((i for i, depth, _ in headings if i > start and depth <= level), len(body.splitlines()))
+    return start, end
+
+
+def read_sections(body: str, sections: list[str]) -> str:
+    lines = body.splitlines(keepends=True)
+    # Union preserves document order without duplicating overlapping parent/child sections.
+    selected = set()
+    for heading in sections:
+        start, end = section_bounds(body, heading)
+        selected.update(range(start, end))
+    return "".join(lines[i] for i in sorted(selected))
+
+
 @dataclass
 class Document:
     path: Path

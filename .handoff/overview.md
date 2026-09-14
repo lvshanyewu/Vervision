@@ -4,7 +4,7 @@ type: "overview"
 id: "vervision"
 title: "Vervision"
 summary: "本地运行的个人项目交接与上下文路由工具，通过 Markdown、CLI、WebUI 和 MCP 服务多 Agent、多会话开发。"
-architecture_summary: "`.handoff` Markdown 是事实源；core 负责发现、搜索、Freshness 与写入，MCP/CLI/WebUI 是轻量入口，SQLite 仅作可重建索引。"
+architecture_summary: "项目 Markdown（含登记的外部原文）是事实源；core 负责发现、搜索、Freshness 与写入，MCP/CLI/WebUI 是轻量入口，SQLite 仅作可重建索引与本机核验记录。"
 aliases: ["handoff", "上下文管理", "项目记忆"]
 tags: ["python", "mcp", "local-first"]
 updated_at: "2026-09-10"
@@ -17,6 +17,7 @@ Vervision 面向个人长期项目，用很少的调用把 Agent 路由到正确
 ## 模块导航
 
 - `context-router`：项目发现、统一读取、搜索、Freshness、任务接续，以及 MCP/CLI/WebUI 接口。
+- `design-philosophy`：重大设计决策时导航到根目录 `ZEN.md` 唯一原文；不作为普通任务的默认依赖。
 
 ## 公共约束
 

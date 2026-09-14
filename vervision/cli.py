@@ -47,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     gui.add_argument("--host", default="127.0.0.1")
     gui.add_argument("--port", type=int, default=8765)
     gui.add_argument("--no-browser", action="store_true")
+    gui.add_argument("--ready-file", type=Path, help="Write the actual local server URL for the launcher")
     sub.add_parser("mcp")
     return parser
 
@@ -91,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1 if result["errors"] else 0
         elif args.command == "gui":
             from .web import serve
-            serve(args.host, args.port, not args.no_browser)
+            serve(args.host, args.port, not args.no_browser, args.ready_file)
         elif args.command == "mcp":
             from .mcp_server import run
             run()
