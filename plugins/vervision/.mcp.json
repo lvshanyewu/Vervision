@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "vervision": {
+      "command": "python",
+      "args": ["-m", "vervision", "mcp"]
+    }
+  }
+}

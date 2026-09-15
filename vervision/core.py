@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from contextlib import contextmanager
 
-from .formats import Document, dump_document, parse_document, validate_document, section_bounds
+from .formats import Document, dump_document, parse_document, validate_document, section_bounds, markdown_headings
 from .locking import writer
 
 
@@ -305,7 +305,7 @@ def document_semantic_digest(meta: dict[str, Any], body: str) -> str:
 
 def module_status(
     root: Path, doc: Document, inventory: list[Path] | None = None,
-    digest_cache: dict[Path, bytes] | None = None,
+    digest_cache: dict[Path, bytes] | None = None, *, review: bool = False,
 ) -> dict[str, Any]:
     if digest_cache is None:
         digest_cache = {}
@@ -345,14 +345,86 @@ def module_status(
     else:
         document_state = "UNVERIFIED"
         document_reason = "No semantic verification baseline has been recorded."
-    return {
+    result = {
         "state": state, "reason": reason, "verified_at": baseline.get("verified_at"),
         "source_freshness": {"state": state, "digest": current},
         "external_checks": {"state": "NOT_CHECKED"},
         "updated_at": doc.meta.get("updated_at"), "source_count": len(files),
         "sources": files, "missing_sources": missing, "changed_sources": changed_sources, "revision": doc.revision,
         "document_verification": {"state": document_state, "reason": document_reason},
+        "change_summary": None if changed_sources is None else {
+            kind: sum(item["change"] == kind for item in changed_sources)
+            for kind in ("added", "modified", "removed")},
     }
+    if review:
+        result["review_candidates"] = _review_candidates(root, doc, changed_sources)
+    return result
+
+
+def _review_candidates(root: Path, doc: Document, changes: list[dict] | None) -> dict[str, Any]:
+    """Direct textual references only; never infer whether knowledge is wrong."""
+    candidates = []
+    if changes:
+        for heading, content in _body_sections(doc.body, include_history=False):
+            paths = [item["path"] for item in changes
+                     if _path_reference(item["path"], content)]
+            if paths:
+                candidates.append({"module_id": doc.meta["id"], "heading": heading,
+                                   "path": str(doc.path), "source_paths": paths[:5],
+                                   "omitted_source_count": max(0, len(paths) - 5),
+                                   "reason": "Changed source path or filename is mentioned here; relevance is unverified."})
+    return {"basis": "Text references in this module only; candidates may be unrelated or incomplete. Source-set changes are not necessarily code edits. No semantic assessment or baseline diff.",
+            "baseline_known": changes is not None,
+            "candidates": candidates[:5], "omitted_count": max(0, len(candidates) - 5)}
+
+
+def _path_reference(path: str, text: str) -> bool:
+    normalized = path.replace("\\", "/").lower()
+    # A basename can be a clue, but an explicit path in another directory is not.
+    return any(re.search(r"(?<![a-z0-9_./-])" + re.escape(name) + r"(?![a-z0-9_./-])",
+                         text.replace("\\", "/").lower())
+               for name in (normalized, normalized.rsplit("/", 1)[-1]))
+
+
+def _body_sections(body: str, *, include_history: bool = True) -> list[tuple[str | None, str]]:
+    """Non-overlapping ATX slices, sharing the reader's fence-aware parser."""
+    lines = body.splitlines()
+    headings = markdown_headings(body)
+    sections = [(None, "\n".join(lines[:headings[0][0]]))] if headings else [(None, body)]
+    ancestors = []
+    for position, (start, depth, heading) in enumerate(headings):
+        while ancestors and ancestors[-1][0] >= depth:
+            ancestors.pop()
+        ancestors.append((depth, heading))
+        historical = any(re.search(r"^(?:changelog|history|release (?:notes|history)|历史(?:记录)?|发布记录|版本(?:记录|历史))$",
+                                   name, re.I) for _, name in ancestors)
+        end = headings[position + 1][0] if position + 1 < len(headings) else len(lines)
+        if include_history or not historical:
+            sections.append((heading, "\n".join(lines[start:end])))
+    return sections
+
+
+def _search_body(doc: Document, terms: list[str], include_history: bool) -> tuple[str, str | None, str | None]:
+    chunks, best = [], (0, None, None)
+    outline = markdown_headings(doc.body)
+    headings = [h for _, _, h in outline]
+    for heading, content in _body_sections(doc.body, include_history=include_history):
+        lines = content.splitlines()
+        if not include_history:
+            lines = [line for line in lines if not re.search(r"\b\d+\.\d+\.\d+\b|\b20\d\d[-/]\d|sha256|apk.*hash", line, re.I)]
+        text = "\n".join(lines)
+        chunks.append(text)
+        score = sum(_matches_term(term, text.lower()) for term in terms)
+        if score > best[0]:
+            snippet = next((line.strip()[:160] for line in lines
+                            if any(_matches_term(term, line.lower()) for term in terms)), None)
+            unique = heading if heading and headings.count(heading) == 1 else None
+            if unique:
+                index = headings.index(unique)
+                if index + 1 < len(outline) and outline[index + 1][1] > outline[index][1]:
+                    unique = None  # Do not expand a parent into unrelated child sections.
+            best = (score, snippet, unique)
+    return "\n".join(chunks), best[1], best[2]
 
 
 @contextmanager
@@ -495,8 +567,8 @@ def _matches_term(term: str, text: str) -> bool:
 
 
 def search(
-    root: Path, query: str, limit: int = 20, include_next: bool = True,
-    documents: list[Document] | None = None,
+    root: Path, query: str, limit: int = 5, include_next: bool = True,
+    documents: list[Document] | None = None, *, include_history: bool = False,
 ) -> list[dict[str, Any]]:
     lowered = query.lower().strip()
     terms = [t for t in re.split(r"[\s,;:!?，；：！？`\"()（）]+", lowered) if t]
@@ -507,6 +579,8 @@ def search(
     terms = [t for t in dict.fromkeys(terms) if not re.fullmatch(r"[\dv.\-]+", t)]
     ranked = []
     for doc in documents if documents is not None else project_documents(root):
+        if not include_history and doc.meta.get("type") == "continuation" and doc.meta.get("status") == "done":
+            continue
         title = str(doc.meta.get("title", ""))
         summary = str(doc.meta.get("summary", ""))
         aliases = " ".join(map(str, doc.meta.get("aliases", [])))
@@ -514,26 +588,22 @@ def search(
         fields = [(title.lower(), 12), (aliases.lower(), 12), (tags.lower(), 10), (summary.lower(), 6),
                   (" ".join(map(str, doc.meta.get("sources", []))).lower(), 9),
                   (" ".join(map(str, doc.meta.get("dependencies", []))).lower(), 8)]
-        body = "\n".join(line for line in doc.body.lower().splitlines()
-                         if not re.search(r"\b\d+\.\d+\.\d+\b|\b20\d\d[-/]\d|sha256|apk.*hash", line))
+        body, snippet, heading = _search_body(doc, terms, include_history)
         score = sum(weight for term in terms for text, weight in fields if _matches_term(term, text))
-        score += min(2, sum(1 for term in terms if _matches_term(term, body)))
+        score += min(2, sum(1 for term in terms if _matches_term(term, body.lower())))
         paths = [doc.path.relative_to(root).as_posix(), *map(str, doc.meta.get("sources", []))]
         exact_paths = []
         for path in paths:
             normalized = path.replace("\\", "/").lower()
             if any(c in normalized for c in "*?[") or not Path(normalized).suffix:
                 continue
-            names = (normalized, normalized.rsplit("/", 1)[-1])
-            if any(re.search(r"(?<![a-z0-9_./-])" + re.escape(name) + r"(?![a-z0-9_./-])",
-                             lowered.replace("\\", "/")) for name in names):
+            if _path_reference(normalized, lowered):
                 exact_paths.append(path)
         if not terms or score or exact_paths:
-            ranked.append((score, doc, exact_paths))
+            ranked.append((score, doc, exact_paths, body, snippet, heading))
     ranked.sort(key=lambda item: (not bool(item[2]), -item[0], str(item[1].meta.get("title", ""))))
-    project_id = parse_document(root / ".handoff" / "overview.md").meta.get("id")
     results = []
-    for score, doc, exact_paths in ranked[:limit]:
+    for score, doc, exact_paths, body, snippet, heading in ranked[:limit]:
         result = {"id": doc.meta.get("id"), "type": doc.meta.get("type"), "title": doc.meta.get("title"),
                   "summary": doc.meta.get("summary"), "score": score, "revision": doc.revision}
         matched_fields = []
@@ -542,20 +612,28 @@ def search(
                            ("tags", " ".join(map(str, doc.meta.get("tags", [])))),
                            ("summary", str(doc.meta.get("summary", ""))),
                            ("sources", " ".join(map(str, doc.meta.get("sources", [])))),
-                           ("dependencies", " ".join(map(str, doc.meta.get("dependencies", [])))), ("body", doc.body)):
+                           ("dependencies", " ".join(map(str, doc.meta.get("dependencies", [])))), ("body", body)):
             if any(_matches_term(term, text.lower()) for term in terms):
                 matched_fields.append(name)
-        result["match_reason"] = {"fields": matched_fields,
-                                  "snippet": next((line.strip()[:160] for line in doc.body.splitlines()
-                                                   if any(_matches_term(term, line.lower()) for term in terms)), None)}
+        result["match_reason"] = {"fields": matched_fields, "snippet": snippet}
+        if heading:
+            result["matched_section"] = heading
         if exact_paths:
             result["matched_paths"] = exact_paths
         if include_next:
             result["next_action"] = {"tool": f"{doc.meta.get('type')}_get", "arguments": {
                 "project": str(root.resolve()), "id": doc.meta.get("id"), "full": False,
+                **({"sections": [heading]} if heading else {}),
             }}
         results.append(result)
     return results
+
+
+def search_page(root: Path, query: str, limit: int = 5, include_history: bool = False) -> dict[str, Any]:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
+        raise ValueError("limit must be an integer from 1 to 50")
+    results = search(root, query, limit + 1, include_history=include_history)
+    return {"results": results[:limit], "has_more": len(results) > limit}
 
 
 def resolve_task(root: Path, task: str, limit: int = 3, detail: str = "concise") -> dict[str, Any]:
@@ -626,14 +704,23 @@ def resolve_task(root: Path, task: str, limit: int = 3, detail: str = "concise")
              "revision": c.revision, "status": c.meta.get("status"), "external_checks": c.meta.get("external_checks", [])}
             for c in continuations if c.meta.get("module_id") == result["id"] and c.meta.get("status") != "done"
         ]
+        result["change_summary"] = full_status["change_summary"]
+        if detail == "concise":
+            result["open_continuations"] = [
+                {key: item[key] for key in ("id", "title", "status", "revision")}
+                for item in result["open_continuations"]]
         result.pop("next_action", None)
+    groups: dict[str | None, list[str]] = {}
+    for result in results:
+        groups.setdefault(result.get("matched_section"), []).append(result["id"])
+    actions = [{"tool": "module_get_many", "arguments": {
+        "project": str(root.resolve()), "ids": ids, "full": False,
+        **({"sections": [heading]} if heading else {})}} for heading, ids in groups.items()]
     return {"task": task, "project": {"id": overview.meta.get("id"), "title": overview.meta.get("title"), "path": str(root)},
             "project_context": {"summary": overview.meta.get("summary"),
                                  "architecture": overview.meta.get("architecture_summary", overview.meta.get("summary", ""))},
             "matches": results, "dependency_summaries": dependency_summaries,
-            "next_actions": ([{"tool": "module_get_many", "arguments": {"project": str(root.resolve()),
-                                "ids": [r["id"] for r in results], "full": False}}]
-                             if results else [{"tool": "search", "arguments": {"project": str(root.resolve()), "query": task}}])}
+            "next_actions": actions or [{"tool": "search", "arguments": {"project": str(root.resolve()), "query": task}}]}
 
 
 @writer
@@ -710,11 +797,15 @@ def save_continuation(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Invalid continuation id")
     path = root / ".handoff" / "continuations" / f"{task_id}.md"
     current = parse_document(path) if path.exists() else None
+    expected = payload.get("expected_revision")
     if current:
-        if payload.get("expected_revision") != current.revision:
-            raise RevisionConflict(current, payload, payload.get("expected_revision"))
+        if expected is not None and expected != current.revision:
+            raise RevisionConflict(current, payload, expected)
         payload = {**current.meta, "body": current.body, **payload}
+    elif expected not in (None, "new"):
+        raise RuntimeError(f"Continuation '{task_id}' no longer exists; use expected_revision='new' only to intentionally recreate it.")
     meta = {
+        **(current.meta if current else {}),
         "schema_version": 1, "type": "continuation", "id": task_id,
         "title": payload.get("title", task_id), "module_id": payload.get("module_id", ""),
         "status": payload.get("status", "open"), "next_step": payload.get("next_step", ""),

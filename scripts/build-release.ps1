@@ -39,7 +39,12 @@ if (Test-Path -LiteralPath (Join-Path $projectRoot "assets\icon.png")) {
 Copy-Item -LiteralPath (Join-Path $projectRoot "FORMAT.md") -Destination $releaseDir
 Copy-Item -LiteralPath (Join-Path $projectRoot "ZEN.md") -Destination $releaseDir
 Copy-Item -LiteralPath (Join-Path $projectRoot "CHANGELOG.md") -Destination $releaseDir
+Copy-Item -LiteralPath (Join-Path $projectRoot "LICENSE") -Destination $releaseDir
+Copy-Item -LiteralPath (Join-Path $projectRoot "docs") -Destination $releaseDir -Recurse
+Copy-Item -LiteralPath (Join-Path $projectRoot "plugins") -Destination $releaseDir -Recurse
 Compress-Archive -LiteralPath $releaseDir -DestinationPath (Join-Path $projectRoot "dist\Vervision-$releaseVersion-windows-x64.zip") -Force
+python (Join-Path $projectRoot "scripts\build-plugin.py")
+if ($LASTEXITCODE -ne 0) { throw "Plugin packaging failed" }
 $versionedExe = Join-Path $projectRoot "dist\vervision-$releaseVersion.exe"
 try {
   Copy-Item -LiteralPath $builtExe -Destination $versionedExe -Force

@@ -20,15 +20,17 @@ verified_document_digest: "5c009bbeefd36ad45f55ce0970684a8e03d0765f6f005ee485b73
 
 # 当前实现
 
-`core.py` 管理项目登记、文档检索、来源指纹、独立语义核验、模块写入和 continuation。显式项目优先；其次按工作区包含关系定位最近项目。多候选不按任务分数或唯一模块 ID 自动选择。检索标题、aliases、tags、sources、dependencies 权重高于正文，正文得分封顶并过滤版本流水。英文关键词使用词边界；精确登记的来源或文档路径/文件名优先，resolve 有精确模块命中时不再扩展泛关键词候选。
+`core.py` 管理项目登记、文档检索、来源指纹、独立语义核验、模块写入和 continuation。显式项目优先；其次按工作区包含关系定位最近项目。多候选不按任务分数或唯一模块 ID 自动选择。检索标题、aliases、tags、sources、dependencies 权重高于正文，正文得分封顶，默认过滤版本流水、明确历史小节和 done 任务；snippet 与排序使用同一份文本。search 默认五项，has_more 提示更多，limit 可扩展至 50，include_history 显式查历史。英文关键词使用词边界；精确登记的来源或文档路径/文件名优先，resolve 有精确模块命中时不再扩展泛关键词候选。
 
-`mcp_server.py` 的 resolve 返回仅当前 MCP 会话有效的 scope_id 和模块 revision。后续调用复用 scope；与显式项目或工作区冲突时拒绝。默认 structuredContent/concise，resolve/search 的下一步先返回 metadata、来源路径和章节标题。读取接口支持 sections 选择唯一 ATX 标题及子章节，或 full=true 显式读取该文档全文；两者互斥。模块只附带 continuation 的 id/title/status，历史正文通过 continuation_get 显式读取。正式类型读取保留，handoff_get 兼容。
+`mcp_server.py` 的 resolve 返回仅当前 MCP 会话有效的 scope_id 和模块 revision。后续调用复用 scope；与显式项目或工作区冲突时拒绝。默认 structuredContent/concise，resolve/search 的下一步优先选择命中且唯一的末级小节；无可靠小节时返回 metadata 与标题导航。resolve 按相同小节分组批量读取，默认任务索引不带 next_step/external_checks。读取接口支持 sections 选择唯一 ATX 标题及子章节，或 full=true 显式读取该文档全文；两者互斥。模块默认只附未完成 continuation 的 id/title/status，full=true 列出全部索引，历史正文通过 continuation_get 显式读取。正式类型读取保留，handoff_get 兼容。
 
 模块元数据使用部分更新；module_patch 与章节读取共用 formats.py 的围栏感知标题解析。批量 module_save_many 每项独立保存并可 verify=true，采用明确的部分成功报告，不实现跨文件事务。module_save_and_verify 在同一项目写锁下完成保存和核验，核验失败保留保存并返回最终 revision 与错误。locking.py 提供跨进程写锁，单文件写入采用临时文件替换；revision 固定于文档读取快照。
 
-verify 将源码指纹、逐文件哈希、语义指纹、verified_at 写入本机 SQLite verification 表，不改写 Markdown。重复核验幂等；reindex 保留核验表，换机器或删除索引后需重新核验。旧文件基线兼容，本机新基线优先。module_status.changed_sources 给出 added/modified/removed 路径，旧基线没有逐文件证据时为 null，显式语义核验后补齐；不推测过期章节。source_freshness 只说明来源变化，document_verification 只记录 Agent/人工语义核对，external_checks 默认 NOT_CHECKED。
+verify 将源码指纹、逐文件哈希、语义指纹、verified_at 写入本机 SQLite verification 表，不改写 Markdown。重复核验幂等；reindex 保留核验表，换机器或删除索引后需重新核验。旧文件基线兼容，本机新基线优先。module_status.changed_sources 给出 added/modified/removed 路径，旧基线没有逐文件证据时为 null，显式语义核验后补齐；change_summary 返回增删改数量。review=true 按需返回当前模块直接提及变更路径或文件名的候选位置，至多五项并标明不确定性与遗漏数量，不推测语义正确性或提供核验基线代码 diff。source_freshness 只说明来源变化，document_verification 只记录 Agent/人工语义核对，external_checks 默认 NOT_CHECKED。
 
-临时进度写 continuation，更新需 expected_revision，冲突返回当前 revision，省略字段保留，可只改 status=done。external_checks 保存 Agent 提供的 service/status/evidence/checked_at，仍留在有时间与任务范围的原记录中。临时任务文档可通过 continuation 引用路径并由 search 发现；done 记录不是当前指令。版本历史写 CHANGELOG 或发布记录；长期规则改变时才 patch 模块，不自动搬运临时正文。
+临时进度写 continuation，普通部分更新不要求预读或 expected_revision；在写锁内保留省略字段，同字段后写覆盖先写。依赖读到的版本时显式传 expected_revision，冲突返回当前 revision；new 表示仅创建，旧 revision 不重建已删除文档。可只改 status=done。external_checks 保存 Agent 提供的 service/status/evidence/checked_at，仍留在有时间与任务范围的原记录中。临时任务文档可通过 continuation 引用路径并由 search 发现；done 记录不是当前指令。版本历史写 CHANGELOG 或发布记录；长期规则改变时才 patch 模块，不自动搬运临时正文。
+
+Codex 插件位于 plugins/vervision，只有 Skill 和现有 stdio MCP 配置；需本机 Vervision 0.5.0+，Core 不依赖 Codex。scripts/build-plugin.py 打包通用插件，build-release.ps1 同时生成 Windows 包与插件 ZIP。使用边界见 docs/retrieval-and-stale-plan.md。
 
 设计哲学导航见 design-philosophy 模块，唯一原文在根目录 ZEN.md。重大设计取舍按任务需要阅读原文，不设为普通实现任务的必读依赖。
 

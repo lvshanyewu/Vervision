@@ -55,7 +55,8 @@ class RoutingTests(unittest.TestCase):
                 read = call_tool(action["tool"], action["arguments"])
                 pointer = next(m for m in read["results"] if m["id"] == "design-philosophy")
                 self.assertEqual(pointer["sources"], ["ZEN.md"])
-                self.assertNotIn("body", pointer)
+                if "body" in pointer:
+                    self.assertIn("sections", action["arguments"])
                 self.assertNotIn("Route precisely. Reveal progressively.", json.dumps(read))
         ordinary = core.resolve_task(self.root, "修改 src/feature.py 格式")
         self.assertNotIn("design-philosophy", [m["id"] for m in ordinary["matches"]])
@@ -66,7 +67,10 @@ class RoutingTests(unittest.TestCase):
                                           "next_step": "Obsolete instruction", "body": "Use an obsolete model"})
         for args in ({}, {"full": True}):
             result = self.read(**args)
-            self.assertEqual(result["continuations"][0]["id"], "old")
+            if args.get("full"):
+                self.assertEqual(result["continuations"][0]["id"], "old")
+            else:
+                self.assertEqual(result["continuations"], [])
             self.assertNotIn("Obsolete instruction", json.dumps(result))
             self.assertNotIn("Use an obsolete model", json.dumps(result))
         old = call_tool("continuation_get", {"project": str(self.root), "id": "old", "full": True})
@@ -132,10 +136,105 @@ class RoutingTests(unittest.TestCase):
         args = {"project": str(self.root), "id": "task", "module_id": "feature", "next_step": "Review"}
         saved = call_tool("continuation_save", args)
         with self.assertRaises(core.RevisionConflict) as caught:
-            call_tool("continuation_save", {"project": str(self.root), "id": "task", "status": "done"})
+            call_tool("continuation_save", {"project": str(self.root), "id": "task", "status": "done", "expected_revision": "stale"})
         self.assertEqual(caught.exception.details["revision"], saved["revision"])
         description = next(t["description"] for t in TOOLS if t["name"] == "continuation_save")
-        self.assertIn("require expected_revision", description)
+        self.assertIn("Optional expected_revision", description)
+
+    def set_body(self, body):
+        core.save_module(self.root, {"id": "feature", "body": body}, core.get_module(self.root, "feature").revision)
+
+    def test_search_prefers_current_section_and_history_is_explicit(self):
+        self.set_body("# History\n## Old\nRouting retired policy\n# Current\nRouting active policy\n# Other\nUnrelated notes\n")
+        core.save_continuation(self.root, {"id": "old", "title": "Routing", "module_id": "feature", "status": "done", "next_step": "Routing retired"})
+        result = call_tool("search", {"project": str(self.root), "query": "routing"})
+        self.assertEqual([r["id"] for r in result["results"]], ["feature"])
+        hit = result["results"][0]
+        self.assertEqual(hit["matched_section"], "Current")
+        self.assertIn("active", hit["match_reason"]["snippet"])
+        read = call_tool(hit["next_action"]["tool"], hit["next_action"]["arguments"])
+        self.assertNotIn("retired", read["body"])
+        self.assertNotIn("Unrelated", read["body"])
+        expanded = call_tool("search", {"project": str(self.root), "query": "routing", "include_history": True})
+        self.assertIn("old", [r["id"] for r in expanded["results"]])
+        self.assertIn("retired", self.read(full=True)["body"])
+
+    def test_search_snippet_and_ranking_use_same_filtered_lines(self):
+        self.set_body("# Current\nRouting 1.0.3 old release\nRouting current policy\n")
+        hit = core.search(self.root, "routing")[0]
+        self.assertEqual(hit["match_reason"]["snippet"], "Routing current policy")
+        self.assertEqual(core.search(self.root, "retiredtoken"), [])
+        self.set_body("# Current\nretiredtoken 1.0.3 release\n")
+        self.assertEqual(core.search(self.root, "retiredtoken"), [])
+        self.assertEqual(core.search(self.root, "retiredtoken", include_history=True)[0]["id"], "feature")
+
+    def test_search_does_not_propose_ambiguous_or_parent_sections(self):
+        for body in ("# Same\nRouting\n# Same\nRouting\n", "# Routing\nRouting\n## History\nOld\n"):
+            self.set_body(body)
+            hit = core.search(self.root, "routing")[0]
+            self.assertNotIn("sections", hit["next_action"]["arguments"])
+            self.assertNotIn("matched_section", hit)
+
+    def test_search_limit_and_more_are_shared_with_cli(self):
+        for i in range(7):
+            core.save_module(self.root, {"id": f"item-{i}", "summary": "needle", "sources": ["src/feature.py"]})
+        args = {"project": str(self.root), "query": "needle"}
+        page = call_tool("search", args)
+        self.assertEqual(len(page["results"]), 5)
+        self.assertTrue(page["has_more"])
+        self.assertFalse(call_tool("search", {**args, "limit": 10})["has_more"])
+        for limit in (0, 51, True, 1.5):
+            with self.assertRaises(ValueError):
+                call_tool("search", {**args, "limit": limit})
+        import subprocess, sys
+        result = subprocess.run([sys.executable, "-m", "vervision", "search", "needle", "--project", str(self.root), "--limit", "2"], capture_output=True, text=True, encoding="utf-8", timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(json.loads(result.stdout)["results"]), 2)
+
+    def test_resolve_groups_matching_sections_without_loading_bodies(self):
+        self.set_body("# Policy\nRouting policy\n# Other\nUnrelated\n")
+        resolved = call_tool("resolve", {"project": str(self.root), "task": "feature routing"})
+        self.assertNotIn("body", resolved["matches"][0])
+        action = resolved["next_actions"][0]
+        self.assertEqual(action["arguments"]["sections"], ["Policy"])
+        read = call_tool(action["tool"], action["arguments"])
+        self.assertNotIn("Unrelated", read["results"][0]["body"])
+
+    def test_review_candidates_are_bounded_explicit_and_do_not_verify(self):
+        self.set_body("# Other\nelsewhere/feature.py\n# History\nfeature.py old\n" + "".join(f"# Current {i}\nSee `src/feature.py`.\n" for i in range(7)))
+        core.verify_module(self.root, "feature")
+        (self.root / "src/feature.py").write_text("VALUE = 2\n", encoding="utf-8")
+        doc = core.get_module(self.root, "feature")
+        before = doc.path.read_bytes()
+        baseline = core.verification_baseline(self.root, doc)
+        status = core.module_status(self.root, doc)
+        self.assertEqual(status["change_summary"], {"added": 0, "modified": 1, "removed": 0})
+        self.assertNotIn("review_candidates", status)
+        expanded = call_tool("module_status", {"project": str(self.root), "module_id": "feature", "review": True})
+        review = expanded["review_candidates"]
+        self.assertTrue(review["baseline_known"])
+        self.assertEqual(len(review["candidates"]), 5)
+        self.assertEqual(review["omitted_count"], 2)
+        self.assertIn("unverified", review["candidates"][0]["reason"])
+        self.assertEqual(review["candidates"][0]["heading"], "Current 0")
+        self.assertEqual(doc.path.read_bytes(), before)
+        self.assertEqual(core.verification_baseline(self.root, doc), baseline)
+        self.assertEqual(expanded["state"], "STALE")
+
+    def test_review_distinguishes_unknown_no_change_and_no_reference(self):
+        doc = core.get_module(self.root, "feature")
+        unknown = core.module_status(self.root, doc, review=True)
+        self.assertIsNone(unknown["change_summary"])
+        self.assertFalse(unknown["review_candidates"]["baseline_known"])
+        core.verify_module(self.root, "feature")
+        fresh = core.module_status(self.root, doc, review=True)
+        self.assertEqual(fresh["review_candidates"]["candidates"], [])
+        self.assertEqual(sum(fresh["change_summary"].values()), 0)
+        (self.root / "src/feature.py").unlink()
+        stale = core.module_status(self.root, doc, review=True)
+        self.assertEqual(stale["change_summary"]["removed"], 1)
+        self.assertTrue(stale["review_candidates"]["baseline_known"])
+        self.assertEqual(stale["review_candidates"]["candidates"], [])
 
 
 if __name__ == "__main__":

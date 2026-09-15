@@ -12,7 +12,7 @@ V1 不调用大模型，不需要在线服务，也不把 Markdown 锁进数据�
 
 ### Windows 安装包
 
-解压 `Vervision-0.4.1-windows-x64.zip`，进入解压后的文件夹，在 PowerShell 中执行：
+解压 `Vervision-0.5.0-windows-x64.zip`，进入解压后的文件夹，在 PowerShell 中执行：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
@@ -120,6 +120,14 @@ Freshness 只回答“关联代码在核验后是否变化”。它不能代替�
 
 ## MCP 接入 Codex
 
+### Codex 插件
+
+插件源码在 [plugins/vervision](plugins/vervision/README.md)，包含一个简短 Skill 和现有 stdio MCP 配置，采用官方仍支持的 plugin-creator 兼容格式。先安装本地 Vervision，再通过 Codex plugin-creator 加入个人 marketplace 并安装。插件不复制核心逻辑，Core 不依赖 Codex，原 CLI/MCP/WebUI 继续可用。Python 或 EXE 必须在运行插件的本机可用；安装到云端不会自动访问本地 Windows 文件。
+
+0.5.0 已实现当前小节检索与按需变化检查，具体行为和边界见[检索与 STALE 说明](docs/retrieval-and-stale-plan.md)。插件 Skill 与 Core 应一起升级；旧 EXE 不会因为更新 Skill 自动获得新接口。
+
+### 直接配置 MCP
+
 安装 Windows 包后执行：
 
 ```powershell
@@ -137,22 +145,22 @@ codex mcp add vervision -- python -m vervision mcp
 MCP 默认返回 `structuredContent`，文本区只有短提示，不重复嵌套大段 JSON。读取默认返回 metadata 和 ATX 章节标题；`sections=["当前实现"]` 按标题读取正文（包含子章节），`full=true` 获取单份文档全文和诊断，二者不能同时使用。客户端须支持结构化工具结果。接口如下：
 
 - `resolve`：返回会话 `scope_id`、架构摘要、相关模块 revision、约束与下一步批量读取参数。显式项目优先，其次工作区包含关系；无法明确定位且有多个候选时拒绝自动选择，关键词和文档 ID 不再触发跨项目选择。`detail=detailed` 返回检索诊断。scope 绑定当前 MCP 服务会话，重启后重新 resolve；scope 与显式 project/workspace 冲突会拒绝调用。
-- `search`：搜索全部文档类型，附带正式的 `module_get`、`overview_get` 或 `continuation_get` 参数，默认先读摘要与标题。标题、别名、标签、来源和依赖高于正文，正文得分封顶并过滤常见版本流水行。英文关键词按词边界匹配，避免 ui 命中 build。精确登记的文件路径/文件名优先于泛关键词；resolve 存在精确模块命中时只返回这些模块，仍最多三个。resolve 区分 `modify`（建议修改）、`read`（建议读取）、依赖摘要的 `related`（仅关联）；建议不代表必须更新。
+- `search`：默认搜索当前知识和未完成任务，最多五项；`has_more` 表示还有结果，可缩小查询或设置 `limit`（1..50）。`include_history=true` 展开 done 任务与历史正文。附带类型读取参数，命中唯一末级小节时 next_action 直接携带 sections，否则先读摘要与标题。标题、别名、标签、来源和依赖高于正文，正文得分封顶；默认过滤常见版本流水行和明确的历史标题小节，摘要与排序使用同一份过滤文本。英文关键词按词边界匹配，避免 ui 命中 build。精确登记的文件路径/文件名优先于泛关键词；resolve 存在精确模块命中时只返回这些模块，仍最多三个。resolve 区分 `modify`（建议修改）、`read`（建议读取）、依赖摘要的 `related`（仅关联）；建议不代表必须更新。
 - `module_get`、`overview_get`、`continuation_get`：明确类型的读取接口；`handoff_get` 保留兼容。
 - `module_get_many`：一次读取 `ids`，最多 50 个，失败项单独报告，项目选择信息不逐项重复。`sections` 对每份模块使用相同的标题选择；不同标题宜分别读取。标题必须唯一，重复或不存在时明确报错。不会静默截断正文；很大的章节仍可选择更细的子标题或直接查看原文件。
-- `module_status`：单独检查 Freshness。
+- `module_status`：单独检查 Freshness 和 `change_summary` 增删改计数；`review=true` 按需返回当前模块中引用变更文件的候选位置，最多五项并报告遗漏数，明确未作语义判断。
 - `module_save`：新增或部分更新模块；更新已有模块必须使用 `expected_revision`，省略字段保留、显式空数组清空。无变化保存不会重写文件。
 - `module_patch`：携带 `id`、`expected_revision`，用 `fields` 部分更新元数据，用 `sections: [{heading, body}]` 替换 Markdown 标题下内容。标题保留，替换范围包含其子标题；同名标题、缺失标题报错，代码围栏内的标题忽略。不支持 Setext 标题和任意 JSON Patch，避免多套修改语法。
 - `module_save_many`：`changes` 中每项使用 save 字段或 patch 的 fields/sections，可设置 `verify=true`。采用明确的部分成功模式，不做批次回滚；每项返回最终 revision、changed、verified 或错误。重复 ID 在写入前拒绝。每项持有项目写锁并以文件替换方式落盘，防止多个 Vervision Agent 同时覆盖。
 - `module_save_and_verify`：一次保存/patch 并声明 Agent 已完成语义核对。源码路径失效时返回 `verified=false` 和 `verification_error`，已保存内容及最终 revision 保留。只需记录知识时用普通 save，不必每轮核验。
 - `module_verify`：Agent 完成语义核对后刷新本机基线。`changed=false` 表示文件不变，`verification_changed` 表示基线是否变化。不会检查正文数字、APK 哈希或外部服务。
-- `continuation_save`：记录进度、阻塞、下一步及可选 external_checks（service/status/evidence/checked_at）。更新须带 expected_revision，省略字段保留，可只改 status=done。发布进度不必修改模块正文。
+- `continuation_save`：记录进度、阻塞、下一步及可选 external_checks（service/status/evidence/checked_at）。普通部分更新无需预读或 revision；在写锁内合并，省略字段保留，可只改 status=done。依赖读到的版本时传 expected_revision，只有不匹配才报冲突；expected_revision="new" 表示仅创建。无 revision 时同一字段后写覆盖先写，正文改写宜携带 revision。发布进度不必修改模块正文。
 
 所有接口均接受 `scope_id`，无需重复 project/workspace。冲突返回当前 revision、请求与当前字段差异，以及最多 4000 字符的正文差异；不会自动覆盖冲突，也不会假称掌握旧版本全文。
 
-典型开发流程为 `resolve → module_get_many（摘要、来源路径、章节标题）→ 按需 sections 或直接查看源码 → 修改`。resolve/search 不再建议默认加载全文；已有足够证据时可以跳过读取，直接使用 revision 做字段或段落 patch。模块全文也只附带 continuation 的 id/title/status，历史正文须显式 continuation_get，避免旧指令混入当前上下文。单纯补传 APK 的任务通常只更新 continuation，长期规则真正改变时才更新模块。
+典型开发流程为 `resolve → 按需执行 next_actions（相关小节，或摘要与标题）→ 查看源码 → 修改`。不同匹配小节分组返回批量读取参数。resolve/search 不再建议默认加载全文；已有足够证据时可以跳过读取，直接使用 revision 做字段或段落 patch。默认模块读取仅列未完成 continuation 的 id/title/status；full=true 才列全部任务索引，历史正文须显式 continuation_get，避免旧指令混入当前上下文。单纯补传 APK 的任务通常只更新 continuation，长期规则真正改变时才更新模块。
 
-`module_status.changed_sources` 列出核验以来 added/modified/removed 的相对文件路径，不提供 diff 或推测过期章节。没有逐文件基线时返回 null（未知），已建立基线且无变化时为 []；下一次完成语义核对后的 verify 会补齐旧基线。它反映登记来源集合的变化，包括 sources 配置调整，不等同于 Git 工作区状态。外部验证仍通过 continuation 的 external_checks 显式读取，不将过去某环境的结果当作模块当前状态。
+`module_status.changed_sources` 列出核验以来 added/modified/removed 的相对文件路径，不提供核验基线代码 diff 或语义判断。`change_summary` 给出增删改计数；`review=true` 的候选仅依据当前模块正文中的直接路径/文件名引用，可能无关或遗漏，不能据此断言某小节过期。没有逐文件基线时返回 null（未知），已建立基线且无变化时为 []；下一次完成语义核对后的 verify 会补齐旧基线。它反映登记来源集合的变化，包括 sources 配置调整，不等同于 Git 工作区状态。外部验证仍通过 continuation 的 external_checks 显式读取，不将过去某环境的结果当作模块当前状态。
 
 本项目的设计哲学唯一原文是根目录 [ZEN.md](ZEN.md)。`.handoff/modules/design-philosophy.md` 仅用现有 aliases/tags/sources 为重大设计决策导航，不复制原文，也不成为所有模块的依赖。其他外部文档也可用现有来源路径登记；临时任务说明可在 continuation 的标题、next_step 和正文中引用原路径，再用 search 定位，不需要新建 task_note 类型。已完成 continuation 是历史记录，不是当前用户指令。
 
@@ -165,7 +173,7 @@ MCP 默认返回 `structuredContent`，文本区只有短提示，不重复嵌�
 建议在项目 Agent 规则中加入：
 
 ```text
-开始功能开发前，先调用 Vervision resolve 查询当前任务；通常使用默认 concise 响应。
+需要项目交接知识时，使用 Vervision resolve 查询当前任务；通常使用默认 concise 响应，已有充分证据可跳过。
 使用返回的 scope_id 和 module_get_many 参数按需读取正文；来源为 STALE/UNVERIFIED，或文档核验为 PENDING/UNKNOWN_LEGACY 时，先核对真实代码与当前运行环境。
 更新已有模块时携带刚读取的 expected_revision；省略字段表示保留，显式空数组才表示清空。
 临时进度更新 continuation；稳定知识优先 patch，并把多模块修改合并到 module_save_many。只有完成语义核对才设置 verify=true；核验不会改变正文 revision。FRESH 不代表测试数量、APK 哈希或外部服务已验证。
@@ -179,7 +187,7 @@ MCP 默认返回 `structuredContent`，文本区只有短提示，不重复嵌�
 handoff init [path]
 handoff validate [--project path-or-id]
 handoff import <prepared-path> [--project path-or-id] [--replace]
-handoff search <query> [--project path-or-id]
+handoff search <query> [--project path-or-id] [--limit 1..50] [--include-history]
 handoff resolve <task> [--project path-or-id] [--detail concise|detailed]
 handoff status [--project path-or-id]
 handoff verify <module-id> [--project path-or-id]

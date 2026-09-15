@@ -150,15 +150,62 @@ class WorkflowTests(unittest.TestCase):
                 "status": "blocked", "next_step": "Retry", "body": "Temporary failure",
                 "external_checks": [{"service": "OpenList", "status": "failed", "evidence": "HTTP 503", "checked_at": "2026-09-12T12:00:00Z"}]}
         saved = call_tool("continuation_save", args)
-        with self.assertRaises(core.RevisionConflict):
-            call_tool("continuation_save", {"project": str(self.root), "id": "upload", "status": "done"})
-        done = call_tool("continuation_save", {"project": str(self.root), "id": "upload", "status": "done", "expected_revision": saved["revision"]})
+        done = call_tool("continuation_save", {"project": str(self.root), "id": "upload", "status": "done"})
         doc = core.get_document(self.root, "upload", "continuation")
         self.assertEqual(doc.body, "Temporary failure\n")
         self.assertEqual(done["status"], "done")
         self.assertEqual(self.scope()["matches"][0]["open_continuations"], [])
         core.verify_module(self.root, "feature")
         self.assertEqual(core.module_status(self.root, core.get_module(self.root, "feature"))["external_checks"]["state"], "NOT_CHECKED")
+
+    def test_continuation_direct_update_preserves_extensions_and_is_idempotent(self):
+        args = {"project": str(self.root), "id": "task", "module_id": "feature", "next_step": "Review", "body": "Notes"}
+        call_tool("continuation_save", args)
+        doc = core.get_document(self.root, "task", "continuation")
+        core._write_document(doc.path, {**doc.meta, "extension_note": "Keep"}, doc.body)
+        updated = call_tool("continuation_save", {"project": str(self.root), "id": "task", "status": "done"})
+        before, stamp = doc.path.read_bytes(), doc.path.stat().st_mtime_ns
+        repeated = call_tool("continuation_save", {"project": str(self.root), "id": "task", "status": "done"})
+        self.assertFalse(repeated["changed"])
+        self.assertEqual(updated["revision"], repeated["revision"])
+        self.assertEqual(doc.path.read_bytes(), before)
+        self.assertEqual(doc.path.stat().st_mtime_ns, stamp)
+        after = core.get_document(self.root, "task", "continuation")
+        self.assertEqual(after.meta["extension_note"], "Keep")
+        self.assertEqual(after.body, "Notes\n")
+
+    def test_continuation_revision_guards_create_update_and_deletion(self):
+        args = {"project": str(self.root), "id": "task", "module_id": "feature", "next_step": "Review", "expected_revision": "new"}
+        saved = call_tool("continuation_save", args)
+        with self.assertRaises(core.RevisionConflict):
+            call_tool("continuation_save", args)
+        updated = call_tool("continuation_save", {**args, "expected_revision": saved["revision"], "next_step": "Test"})
+        with self.assertRaises(core.RevisionConflict) as caught:
+            call_tool("continuation_save", {**args, "expected_revision": saved["revision"]})
+        self.assertEqual(caught.exception.details["revision"], updated["revision"])
+        doc = core.get_document(self.root, "task", "continuation")
+        doc.path.unlink()
+        with self.assertRaisesRegex(RuntimeError, "no longer exists"):
+            call_tool("continuation_save", {**args, "expected_revision": updated["revision"]})
+        self.assertFalse(doc.path.exists())
+
+    def test_continuation_concurrent_partial_updates_and_guarded_writers(self):
+        args = {"id": "task", "module_id": "feature", "next_step": "Review"}
+        core.save_continuation(self.root, args)
+        def write(fields):
+            return core.save_continuation(self.root, {"id": "task", **fields})
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(write, [{"status": "blocked"}, {"next_step": "Retry"}]))
+        doc = core.get_document(self.root, "task", "continuation")
+        self.assertEqual(doc.meta["status"], "blocked")
+        self.assertEqual(doc.meta["next_step"], "Retry")
+        def guarded(body):
+            try:
+                return write({"body": body, "expected_revision": doc.revision})["changed"]
+            except core.RevisionConflict:
+                return False
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            self.assertEqual(sorted(pool.map(guarded, ["First", "Second"])), [False, True])
 
     def test_ranking_ignores_release_log_as_modification_target(self):
         core.save_module(self.root, {"id": "release", "title": "Release engineering", "aliases": ["OpenList 上传"],

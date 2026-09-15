@@ -10,7 +10,7 @@ from pathlib import Path
 from . import __version__
 from .core import (
     import_bundle, init_project, module_documents, module_status, rebuild_index,
-    resolve_project, resolve_task, search, select_project, validate_project, verify_module,
+    resolve_project, resolve_task, search_page, select_project, validate_project, verify_module,
 )
 
 
@@ -32,6 +32,8 @@ def build_parser() -> argparse.ArgumentParser:
     search_p = sub.add_parser("search")
     search_p.add_argument("query")
     search_p.add_argument("--project")
+    search_p.add_argument("--include-history", action="store_true", help="Include done progress and historical body text")
+    search_p.add_argument("--limit", type=int, default=5, help="Result count, 1..50 (default 5)")
     resolve_p = sub.add_parser("resolve")
     resolve_p.add_argument("task")
     resolve_p.add_argument("--project")
@@ -74,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
             if not selection["selected"]:
                 emit({"project_selection": selection, "next": "Retry with --project <candidate-id-or-path>."})
                 return 2
-            emit({"project_selection": selection, "results": search(Path(selection["selected"]), args.query)})
+            emit({"project_selection": selection, **search_page(Path(selection["selected"]), args.query, args.limit, args.include_history)})
         elif args.command == "resolve":
             selection = select_project(task=args.task, project=args.project)
             if not selection["selected"]:

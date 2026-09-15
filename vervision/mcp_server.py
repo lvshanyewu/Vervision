@@ -13,7 +13,7 @@ from .formats import markdown_headings, read_sections
 from .core import (
     continuation_documents, get_document, get_module, module_status, resolve_task,
     save_continuation, save_module, search, select_project, verify_module,
-    patch_module, save_and_verify, RevisionConflict,
+    patch_module, save_and_verify, RevisionConflict, search_page,
 )
 
 
@@ -34,17 +34,17 @@ def _workspace_properties() -> dict[str, Any]:
 TOOLS = [
     {"name": "resolve", "description": "Start here. Locate the correct project and return minimal relevant context, freshness, sources, constraints, dependencies and exact next calls.",
      "inputSchema": {"type": "object", "properties": {"task": {"type": "string"}, "detail": {"type": "string", "enum": ["concise", "detailed"], "default": "concise"}, **_workspace_properties()}, "required": ["task"]}},
-    {"name": "search", "description": "Search all handoff document types; exact registered file paths/names rank first. Each result includes a typed reader call for metadata and headings.",
-     "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, **_workspace_properties()}, "required": ["query"]}},
+    {"name": "search", "description": "Find current knowledge and open progress; default five results, has_more indicates more matches. include_history=true includes done continuations and historical body text. Exact paths rank first; next_action selects a matching unique section when available. Narrow the query or increase limit to expand.",
+     "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 5}, "include_history": {"type": "boolean", "default": False}, **_workspace_properties()}, "required": ["query"]}},
     {"name": "handoff_get", "description": "Unified reader for overview, module and continuation documents returned by resolve/search.",
      "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "type": {"type": "string", "enum": ["overview", "module", "continuation"]}, "full": {"type": "boolean"}, **_workspace_properties()}, "required": ["id"]}},
-    {"name": "module_status", "description": "Check source freshness and independent semantic verification. changed_sources lists added/modified/removed paths since verification; null means no per-file baseline, not no changes. External observations remain in continuations.",
-     "inputSchema": {"type": "object", "properties": {"module_id": {"type": "string"}, **_workspace_properties()}, "required": ["module_id"]}},
+    {"name": "module_status", "description": "Check source freshness and change_summary counts. changed_sources lists added/modified/removed paths since verification; null means unknown baseline. review=true adds at most five candidate sections mentioning changed paths in this module, with uncertainty. No semantic judgment or baseline diff; source-set changes may reflect sources configuration.",
+     "inputSchema": {"type": "object", "properties": {"module_id": {"type": "string"}, "review": {"type": "boolean", "default": False}, **_workspace_properties()}, "required": ["module_id"]}},
     {"name": "module_save", "description": "Create or partially update a module. Existing modules require expected_revision; omitted fields are preserved and explicit empty arrays clear fields.",
      "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "title": {"type": "string"}, "summary": {"type": "string"}, "aliases": {"type": "array", "items": {"type": "string"}}, "tags": {"type": "array", "items": {"type": "string"}}, "sources": {"type": "array", "items": {"type": "string"}}, "dependencies": {"type": "array", "items": {"type": "string"}}, "related_modules": {"type": "array", "items": {"type": "string"}}, "business_rules": {"type": "array", "items": {"type": "string"}}, "invariants": {"type": "array", "items": {"type": "string"}}, "consumers": {"type": "array", "items": {"type": "string"}}, "body": {"type": "string"}, "expected_revision": {"type": "string"}, **_workspace_properties()}, "required": ["id"]}},
     {"name": "module_verify", "description": "Record a FRESH baseline only after comparing the handoff's meaning with current source.",
      "inputSchema": {"type": "object", "properties": {"module_id": {"type": "string"}, "expected_revision": {"type": "string"}, **_workspace_properties()}, "required": ["module_id"]}},
-    {"name": "continuation_save", "description": "Create or partially update temporary progress. Existing continuations require expected_revision from continuation_get or resolve; conflicts return the current revision. Reload affected content before retrying. Omitted fields are preserved.",
+    {"name": "continuation_save", "description": "Create or partially update temporary progress under a write lock. Omitted fields are preserved; supplied fields replace current values without a prior read. Optional expected_revision guards changes based on a read version; use 'new' for create-only. A mismatch returns the current revision; inspect affected content before retrying. Creation needs module_id and nonempty next_step; title defaults to id and status to open.",
      "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "title": {"type": "string"}, "module_id": {"type": "string"}, "status": {"type": "string", "enum": ["open", "blocked", "done"]}, "next_step": {"type": "string"}, "body": {"type": "string"}, **_workspace_properties()}, "required": ["id", "title", "module_id", "status", "next_step"]}},
 ]
 
@@ -134,7 +134,7 @@ def _call_tool(name: str, args: dict[str, Any]) -> Any:
         return result
     if name == "search":
         root, selection = _root_or_error(args, task=str(args["query"]))
-        return {"project_selection": selection, "results": search(root, str(args["query"]))}
+        return {"project_selection": selection, **search_page(root, str(args["query"]), args.get("limit", 5), args.get("include_history", False))}
     if name == "module_get_many":
         root, _ = _root_or_error(args)
         ids = args["ids"]
@@ -160,7 +160,8 @@ def _call_tool(name: str, args: dict[str, Any]) -> Any:
             value["freshness"] = module_status(root, doc)
             value["continuations"] = [{k: d.meta.get(k) for k in ("id", "title", "status")}
                                       for d in continuation_documents(root)
-                                      if d.meta.get("module_id") == doc.meta.get("id")]
+                                      if d.meta.get("module_id") == doc.meta.get("id")
+                                      and (args.get("full") or d.meta.get("status") != "done")]
         if args.get("full", False):
             value["body"] = doc.body
         elif args.get("sections"):
@@ -169,7 +170,7 @@ def _call_tool(name: str, args: dict[str, Any]) -> Any:
     document_id = str(args.get("module_id") or args.get("id") or "")
     root, _ = _root_or_error(args, document_id=document_id or None)
     if name == "module_status":
-        return module_status(root, get_module(root, str(args["module_id"])))
+        return module_status(root, get_module(root, str(args["module_id"])), review=args.get("review", False))
     if name == "module_save":
         return save_and_verify(root, args)
     if name == "module_patch":
@@ -217,6 +218,8 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
             item["freshness"] = {"source_freshness": item["freshness"]["state"],
                                  "document_verification": item["freshness"]["document_verification"]["state"],
                                  "external_checks": "NOT_CHECKED"}
+        if result.get("project_context", {}).get("architecture") == result.get("project_context", {}).get("summary"):
+            result["project_context"].pop("architecture", None)
         return result
     if name.endswith("_get"):
         if "freshness" in result:
@@ -241,9 +244,11 @@ def _compact_write(value):
 
 def _validate(value, schema, path="arguments"):
     expected = schema.get("type")
-    types = {"object": dict, "array": list, "string": str, "boolean": bool}
+    types = {"object": dict, "array": list, "string": str, "boolean": bool, "integer": int}
     if expected in types and not isinstance(value, types[expected]):
         raise ValueError(f"{path} must be {expected}")
+    if expected == "integer" and (isinstance(value, bool) or not schema.get("minimum", -float("inf")) <= value <= schema.get("maximum", float("inf"))):
+        raise ValueError(f"{path} is outside the allowed integer range")
     if "enum" in schema and value not in schema["enum"]:
         raise ValueError(f"{path} must be one of {schema['enum']}")
     if isinstance(value, dict):

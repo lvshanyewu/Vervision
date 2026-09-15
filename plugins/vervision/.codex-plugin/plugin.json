@@ -1,0 +1,18 @@
+{
+  "name": "vervision",
+  "version": "0.5.0",
+  "description": "Find project evidence progressively through the local Vervision MCP server.",
+  "author": {"name": "LSYW"},
+  "license": "MIT",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Vervision",
+    "shortDescription": "Find relevant project knowledge, then expand only what you need.",
+    "longDescription": "Local project context routing and temporary progress through Vervision. Requires a local Vervision installation. Knowledge stays in project Markdown; agents retain responsibility for reasoning and semantic review.",
+    "developerName": "LSYW",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": ["Find the project knowledge relevant to my current task."]
+  }
+}

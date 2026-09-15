@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0
+
+- 检索默认返回最多五项当前知识与未完成任务，`has_more` 表示仍有结果；`limit` 可扩展至 50，`include_history=true` 可查已完成任务与历史正文。
+- 排序、命中理由和摘要复用同一份过滤文本；明确的历史标题及其子节默认不参与正文检索。命中唯一末级小节时，下一步直接给 sections，避免展开父节、历史和相邻内容；无可靠标题时保留摘要导航。
+- 默认模块读取不再列出 done 任务；full=true 保留完整正文和历史任务索引，已知 continuation ID 始终可直接读取。resolve 默认不携带临时任务 next_step/external_checks，也不重复相同的架构摘要。
+- module_status 与 resolve 增加 change_summary 文件增删改计数；`module_status(review=true)` 按需提供当前模块中直接引用变更路径/文件名的候选位置，最多五项，明确不确定性和遗漏数量。无基线仍表示未知，不产生代码 diff、语义结论或自动修订。
+- continuation 普通部分更新不再要求预读 revision；保留省略字段与扩展字段，重复保存不重写文件。显式 expected_revision 检查版本，new 表示仅创建，旧 revision 不会重建已删除记录。
+- 增加独立 Codex 插件包与简短 Skill，复用本机 MCP；Core 不依赖 Codex，原 CLI、MCP、只读 WebUI 继续可用。
+
+升级说明：同一 continuation 字段在省略 revision 时按后写值更新，依赖旧内容的改写应携带 revision。搜索历史需要显式展开；全文读取仍忠实返回原文。Python/EXE 需升级至 0.5.0 并重连 MCP，插件 Skill 更新后新建任务加载。
+
 ## 0.4.1
 
 - 修复 Windows 保留或占用 8765 时 WebUI 无法启动：自动绑定可用端口，启动器读取实际 URL 并校验服务身份和版本，重复启动复用同版本服务。

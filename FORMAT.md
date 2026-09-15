@@ -35,7 +35,7 @@
 
 `revision` 是文档文件的内容版本，源码指纹与核验状态分别存储。重复 save/verify 不改变文件；verify 的 `changed=false` 表示 Markdown 没有变化，`verification_changed` 表示本机基线是否变化。删除索引或换机器会失去本机核验记录，需要重新核对；Markdown 知识不会丢失。普通 reindex 保留 verification 表。
 
-continuation 支持可选 `external_checks` 数组，每项包含 `service`、`status`、`evidence`、`checked_at`，是 Agent 提供的有时间范围的观察记录，不是工具自动探测结果。更新 continuation 必须携带 `expected_revision`，省略字段保留，可只改 `status=done`。Agent 判断内容属于长期知识还是临时进度，工具不按关键词猜测；版本号、APK 哈希、测试数量与发布历史应记录在 CHANGELOG 或发布记录，长期模块只保留设计和约束。
+continuation 支持可选 `external_checks` 数组，每项包含 `service`、`status`、`evidence`、`checked_at`，是 Agent 提供的有时间范围的观察记录，不是工具自动探测结果。更新 continuation 可直接发送变更字段，无需预读；写锁内保留省略字段，同一字段以最后一次写入为准。依赖先前读取内容时传 `expected_revision`，不匹配才报冲突；`expected_revision="new"` 表示仅创建，携带旧 revision 不会重建已删除记录。可只改 `status=done`。创建需要有效 `module_id` 和非空 `next_step`，title 默认 id、status 默认 open。Agent 判断内容属于长期知识还是临时进度，工具不按关键词猜测；版本号、APK 哈希、测试数量与发布历史应记录在 CHANGELOG 或发布记录，长期模块只保留设计和约束。
 
 根目录或其他位置已有原文时，模块可只保留一句导航摘要、相关 aliases/tags 和 `sources: ["原文路径"]`，不复制全文。`dependencies` 表示必要模块依赖，不应被用作强制所有任务加载设计哲学的开关。阶段性任务文档用 continuation 引用路径；完成后标记 done，历史约束不自动提升为当前规则。读取模块时 continuation 仅返回 id/title/status，正文需独立读取。
 
